@@ -1,0 +1,578 @@
+// ─── TradingPanel.jsx ─────────────────────────────────────────────────────────
+import { useState } from "react";
+import { useWalletModal } from "@solana/wallet-adapter-react-ui";
+
+const C = {
+  bg:"#0e1117",surface:"#13171f",surface2:"#161b24",surface3:"#1b2130",
+  border:"#1f2937",hover:"#1a2030",
+  text:"#e2e8f0",text2:"#94a3b8",muted:"#475569",muted2:"#64748b",
+  accent:"#00e5c3",green:"#22c55e",red:"#ef4444",warn:"#f0a500",info:"#7c83ff",
+  mono:"'IBM Plex Mono','Courier New',monospace",
+  sans:"'IBM Plex Sans',system-ui,sans-serif",
+};
+
+// ── Micro components ──────────────────────────────────────────────────────────
+function Mono({ children, color, size="0.75rem", weight=500 }) {
+  return <span style={{fontFamily:C.mono,fontSize:size,color:color||C.text2,fontWeight:weight}}>{children}</span>;
+}
+
+function Badge({ children, color=C.muted2 }) {
+  return (
+    <span style={{fontSize:"0.6rem",fontFamily:C.mono,fontWeight:600,color,
+      background:color+"18",padding:"2px 7px",borderRadius:3,letterSpacing:"0.05em",whiteSpace:"nowrap"}}>
+      {children}
+    </span>
+  );
+}
+
+function Btn({ children, onClick, disabled, variant="default", size="md", fullWidth=false }) {
+  const V = {
+    default:{bg:"transparent",  border:C.border,  color:C.text2},
+    primary:{bg:C.accent+"18",  border:C.accent,  color:C.accent},
+    success:{bg:C.green+"18",   border:C.green,   color:C.green},
+    danger: {bg:C.red+"15",     border:C.red,     color:C.red},
+    warn:   {bg:C.warn+"15",    border:C.warn,    color:C.warn},
+    ghost:  {bg:"transparent",  border:"transparent",color:C.muted2},
+  };
+  const v = V[variant]||V.default;
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      padding:size==="sm"?"4px 10px":size==="lg"?"9px 22px":"5px 14px",
+      background:disabled?"transparent":v.bg,
+      border:`1px solid ${disabled?C.border:v.border}`,
+      borderRadius:5,color:disabled?C.muted:v.color,
+      fontSize:size==="sm"?"0.62rem":"0.68rem",
+      fontFamily:C.mono,fontWeight:600,letterSpacing:"0.06em",
+      cursor:disabled?"not-allowed":"pointer",transition:"all 0.15s",
+      opacity:disabled?0.5:1,width:fullWidth?"100%":"auto",
+    }}>{children}</button>
+  );
+}
+
+function PnlBadge({ pct, sol }) {
+  const pos = (pct||0)>=0;
+  const color = pos?C.green:C.red;
+  return (
+    <div style={{textAlign:"right"}}>
+      <div style={{fontSize:"0.82rem",fontFamily:C.mono,fontWeight:700,color}}>
+        {pos?"+":""}{pct?.toFixed(2)}%
+      </div>
+      <div style={{fontSize:"0.65rem",fontFamily:C.mono,color:color+"bb"}}>
+        {pos?"+":""}{sol?.toFixed(4)} SOL
+      </div>
+    </div>
+  );
+}
+
+// ── Wallet bar ────────────────────────────────────────────────────────────────
+function WalletBar({ connected, walletAddress, solBalance }) {
+  const { setVisible } = useWalletModal();
+  const short = walletAddress
+    ? walletAddress.slice(0,4)+"…"+walletAddress.slice(-4)
+    : null;
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:8,padding:"10px 14px",
+      background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
+      <div style={{width:7,height:7,borderRadius:"50%",
+        background:connected?C.green:C.muted,
+        boxShadow:connected?`0 0 6px ${C.green}`:"none",flexShrink:0}}/>
+      {connected ? (
+        <>
+          <Mono color={C.text} size="0.72rem">{short}</Mono>
+          <div style={{width:1,height:14,background:C.border}}/>
+          <Mono color={C.accent} size="0.72rem" weight={600}>
+            {solBalance!==null?`${solBalance?.toFixed(4)} SOL`:"…"}
+          </Mono>
+          <div style={{flex:1}}/>
+          <Btn size="sm" onClick={()=>setVisible(true)}>CHANGE</Btn>
+        </>
+      ) : (
+        <>
+          <span style={{fontSize:"0.68rem",color:C.muted2,flex:1}}>No wallet connected</span>
+          <Btn size="sm" variant="primary" onClick={()=>setVisible(true)}>CONNECT WALLET</Btn>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Stats bar ─────────────────────────────────────────────────────────────────
+function StatsBar({ stats }) {
+  const pnlColor = (stats.totalPnlSol||0)>=0?C.green:C.red;
+  const winColor = stats.winRate>=50?C.green:stats.winRate>0?C.warn:C.muted;
+  return (
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",
+      background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
+      {[
+        {l:"OPEN",    v:stats.openCount,                                        c:stats.openCount>0?C.accent:C.muted},
+        {l:"QUEUED",  v:stats.queueCount,                                       c:stats.queueCount>0?C.warn:C.muted},
+        {l:"PnL",     v:(stats.totalPnlSol>=0?"+":"")+stats.totalPnlSol?.toFixed(4)+" SOL", c:pnlColor},
+        {l:"WIN RATE",v:stats.tradeCount>0?stats.winRate?.toFixed(0)+"%":"—",  c:winColor},
+      ].map(s=>(
+        <div key={s.l} style={{padding:"8px 0",borderRight:`1px solid ${C.border}`,textAlign:"center"}}>
+          <div style={{fontSize:"0.82rem",fontFamily:C.mono,fontWeight:700,color:s.c}}>{s.v}</div>
+          <div style={{fontSize:"0.55rem",color:C.muted,fontFamily:C.mono,letterSpacing:"0.08em",marginTop:2}}>{s.l}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Settings panel ────────────────────────────────────────────────────────────
+function SettingsPanel({ settings, updateSettings }) {
+  const NumField = ({ label, field, min, max, step, suffix }) => (
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+      padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
+      <span style={{fontSize:"0.67rem",color:C.muted2}}>{label}</span>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <input type="number" value={settings[field]} min={min} max={max} step={step}
+          onChange={e=>updateSettings({[field]:parseFloat(e.target.value)})}
+          style={{width:72,background:C.surface3,border:`1px solid ${C.border}`,
+            borderRadius:4,color:C.text,padding:"3px 8px",
+            fontSize:"0.72rem",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+        {suffix&&<span style={{fontSize:"0.62rem",color:C.muted,minWidth:24}}>{suffix}</span>}
+      </div>
+    </div>
+  );
+  const Toggle = ({ label, field, description }) => (
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+      padding:"9px 0",borderBottom:`1px solid ${C.border}`}}>
+      <div>
+        <div style={{fontSize:"0.67rem",color:C.muted2}}>{label}</div>
+        {description&&<div style={{fontSize:"0.6rem",color:C.muted,marginTop:1}}>{description}</div>}
+      </div>
+      <div onClick={()=>updateSettings({[field]:!settings[field]})}
+        style={{width:38,height:21,borderRadius:11,cursor:"pointer",transition:"background 0.2s",
+          background:settings[field]?C.accent:C.border,position:"relative",flexShrink:0}}>
+        <div style={{width:15,height:15,borderRadius:"50%",background:C.text,
+          position:"absolute",top:3,transition:"left 0.2s",
+          left:settings[field]?20:3}}/>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,overflow:"hidden"}}>
+      <div style={{padding:"10px 14px",background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
+        <span style={{fontSize:"0.65rem",fontFamily:C.mono,fontWeight:700,color:C.text,letterSpacing:"0.1em"}}>
+          TRADE SETTINGS
+        </span>
+      </div>
+      <div style={{padding:"0 14px 10px"}}>
+        <div style={{paddingTop:4}}>
+          <NumField label="Stake per trade"       field="stakeSOL"        min={0.01} max={10}   step={0.01} suffix="SOL"/>
+          <NumField label="Take profit"            field="takeProfitPct"   min={5}    max={500}  step={5}    suffix="%"/>
+          <NumField label="Stop loss"              field="stopLossPct"     min={5}    max={50}   step={1}    suffix="%"/>
+          <NumField label="Slippage tolerance"     field="slippageBps"     min={50}   max={1000} step={50}   suffix="bps"/>
+          <NumField label="Max open positions"     field="maxPositions"    min={1}    max={20}   step={1}/>
+          <NumField label="Min score to queue"     field="minScore"        min={40}   max={95}   step={5}/>
+          <NumField label="Min signal confidence"  field="minConfidence"   min={30}   max={95}   step={5}    suffix="%"/>
+          <NumField label="Cooldown per token"     field="cooldownMinutes" min={5}    max={240}  step={5}    suffix="min"/>
+        </div>
+        <div style={{paddingTop:4}}>
+          <Toggle label="Require momentum signal" field="requireMomentum"
+            description="Only queue EARLY MOMENTUM and UPTREND signals"/>
+          <Toggle label="Auto-execute trades" field="autoExecute"
+            description="⚠ Buys automatically when criteria met"/>
+        </div>
+        {settings.autoExecute&&(
+          <div style={{marginTop:10,padding:"8px 10px",background:C.surface3,
+            borderRadius:5,border:`1px solid ${C.warn}33`}}>
+            <div style={{fontSize:"0.6rem",color:C.warn,lineHeight:1.7}}>
+              ⚠ Auto-execute is active. Trades will fire without approval when a token meets all criteria. Use a dedicated wallet with a capped balance. Never store more SOL than you are willing to lose.
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Queue item ────────────────────────────────────────────────────────────────
+function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
+  const [localStake, setLocalStake] = useState(item.stakeSOL);
+  const [localTP,    setLocalTP]    = useState(item.takeProfitPct);
+  const [localSL,    setLocalSL]    = useState(item.stopLossPct);
+  const [editing,    setEditing]    = useState(false);
+  const isExec = executing[item.id];
+  const age = Math.floor((Date.now()-item.queuedAt)/60000);
+  const sigColor = item.signal?.color||C.muted2;
+
+  return (
+    <div style={{borderBottom:`1px solid ${C.border}`}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10,
+        padding:"11px 14px",alignItems:"start"}}>
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5,flexWrap:"wrap"}}>
+            <Mono color={C.text} size="0.88rem" weight={700}>{item.symbol}</Mono>
+            <Badge color={C.accent}>{item.score}</Badge>
+            {item.signal&&<Badge color={sigColor}>{item.signal.icon} {item.signal.type}</Badge>}
+            {item.signal&&<Badge color={sigColor}>{item.signal.conf}% conf</Badge>}
+            <Badge color={C.muted}>{age}m ago</Badge>
+          </div>
+
+          {!editing ? (
+            <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
+              {[{l:"BUY",v:localStake+" SOL",c:C.text},{l:"TP",v:"+"+localTP+"%",c:C.green},{l:"SL",v:"-"+localSL+"%",c:C.red}].map(s=>(
+                <div key={s.l} style={{display:"flex",gap:4,alignItems:"center"}}>
+                  <span style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono}}>{s.l}</span>
+                  <Mono color={s.c} size="0.72rem" weight={600}>{s.v}</Mono>
+                </div>
+              ))}
+              <button onClick={()=>setEditing(true)}
+                style={{fontSize:"0.58rem",color:C.muted,background:"none",border:"none",cursor:"pointer",fontFamily:C.mono}}>
+                edit ✎
+              </button>
+            </div>
+          ) : (
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+              {[
+                {l:"SOL",val:localStake,set:setLocalStake,min:0.01,step:0.01},
+                {l:"TP%",val:localTP,   set:setLocalTP,   min:5,   step:5},
+                {l:"SL%",val:localSL,   set:setLocalSL,   min:5,   step:1},
+              ].map(f=>(
+                <div key={f.l} style={{display:"flex",alignItems:"center",gap:4}}>
+                  <span style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono}}>{f.l}</span>
+                  <input type="number" value={f.val} min={f.min} step={f.step}
+                    onChange={e=>f.set(parseFloat(e.target.value))}
+                    style={{width:58,background:C.surface3,border:`1px solid ${C.border}`,
+                      borderRadius:3,color:C.text,padding:"2px 6px",
+                      fontSize:"0.68rem",fontFamily:C.mono,outline:"none"}}/>
+                </div>
+              ))}
+              <button onClick={()=>setEditing(false)}
+                style={{fontSize:"0.58rem",color:C.accent,background:"none",border:"none",cursor:"pointer",fontFamily:C.mono}}>
+                done ✓
+              </button>
+            </div>
+          )}
+
+          {item.signal?.detail&&(
+            <div style={{fontSize:"0.62rem",color:C.muted2,marginTop:5,lineHeight:1.5}}>
+              {item.signal.detail}
+            </div>
+          )}
+        </div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:6,alignItems:"flex-end"}}>
+          <Mono color={C.text} size="0.78rem" weight={600}>${item.priceUsd?.toFixed(6)}</Mono>
+          <div style={{display:"flex",gap:5}}>
+            <Btn size="sm" variant="ghost" onClick={()=>onDismiss(item.id)}>✕</Btn>
+            <Btn size="sm" variant="success" disabled={isExec||!connected}
+              onClick={()=>onApprove({...item,stakeSOL:localStake,takeProfitPct:localTP,stopLossPct:localSL})}>
+              {isExec?"BUYING…":"▶ BUY"}
+            </Btn>
+          </div>
+          <a href={item.dexUrl} target="_blank" rel="noopener noreferrer"
+            style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono,textDecoration:"none"}}>
+            chart ↗
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Position card ─────────────────────────────────────────────────────────────
+function PositionCard({ position, onSell, executing, connected }) {
+  const isExec = executing[position.id];
+  const pnl = position.pnlPct||0;
+  const pnlColor = pnl>=0?C.green:C.red;
+  const tpPct = position.takeProfitPct||50;
+  const slPct = position.stopLossPct||20;
+  const upProg = Math.min(100,Math.max(0,(pnl/tpPct)*100));
+  const dnProg = Math.min(100,Math.max(0,(-pnl/slPct)*100));
+  const age = Math.floor((Date.now()-position.openedAt)/60000);
+
+  return (
+    <div style={{borderBottom:`1px solid ${C.border}`,padding:"12px 14px"}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10}}>
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7,flexWrap:"wrap"}}>
+            <div style={{width:3,height:14,borderRadius:1,background:pnlColor,boxShadow:`0 0 5px ${pnlColor}`}}/>
+            <Mono color={C.text} size="0.88rem" weight={700}>{position.symbol}</Mono>
+            <Badge color={C.muted}>{age}m open</Badge>
+            {position.entrySignal&&<Badge color={position.entrySignal.color}>{position.entrySignal.type}</Badge>}
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}}>
+            {[
+              {l:"ENTRY",  v:"$"+position.entryPrice?.toFixed(6),         c:C.muted2},
+              {l:"NOW",    v:"$"+(position.currentPrice||position.entryPrice)?.toFixed(6), c:C.text},
+              {l:"STAKED", v:position.solSpent?.toFixed(4)+" SOL",         c:C.muted2},
+            ].map(s=>(
+              <div key={s.l}>
+                <div style={{fontSize:"0.55rem",color:C.muted,fontFamily:C.mono,marginBottom:2}}>{s.l}</div>
+                <Mono color={s.c} size="0.7rem">{s.v}</Mono>
+              </div>
+            ))}
+          </div>
+
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            {[
+              {label:`TP +${tpPct}%`, prog:upProg,  color:C.green},
+              {label:`SL -${slPct}%`, prog:dnProg,  color:C.red},
+            ].map(bar=>(
+              <div key={bar.label}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                  <span style={{fontSize:"0.55rem",color:bar.color,fontFamily:C.mono}}>{bar.label}</span>
+                  <span style={{fontSize:"0.55rem",color:C.muted,fontFamily:C.mono}}>{bar.prog.toFixed(0)}%</span>
+                </div>
+                <div style={{height:3,background:C.border,borderRadius:2}}>
+                  <div style={{height:"100%",width:`${bar.prog}%`,background:bar.color,
+                    borderRadius:2,boxShadow:`0 0 4px ${bar.color}66`,transition:"width 0.5s"}}/>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:8,justifyContent:"space-between"}}>
+          <PnlBadge pct={position.pnlPct} sol={position.pnlSol}/>
+          <div style={{display:"flex",gap:5}}>
+            <a href={`https://dexscreener.com/solana/${position.pairAddress}`} target="_blank" rel="noopener noreferrer">
+              <Btn size="sm">CHART ↗</Btn>
+            </a>
+            <Btn size="sm" variant="danger" disabled={isExec||!connected}
+              onClick={()=>onSell(position,"MANUAL")}>
+              {isExec?"SELLING…":"SELL"}
+            </Btn>
+          </div>
+          {position.entryTx&&(
+            <a href={`https://solscan.io/tx/${position.entryTx}`} target="_blank" rel="noopener noreferrer"
+              style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono,textDecoration:"none"}}>
+              tx {position.entryTx.slice(0,6)}… ↗
+            </a>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── History row ───────────────────────────────────────────────────────────────
+function HistoryRow({ trade }) {
+  const win = (trade.pnlSol||0)>=0;
+  const color = win?C.green:C.red;
+  const rColors = {TAKE_PROFIT:C.green,STOP_LOSS:C.red,MANUAL:C.muted2};
+  const dt = new Date(trade.closedAt);
+  const dateStr = dt.toLocaleDateString("en-GB",{day:"2-digit",month:"short"})+" "+dt.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
+
+  return (
+    <div style={{display:"grid",gridTemplateColumns:"1fr auto auto auto",gap:8,
+      alignItems:"center",padding:"8px 14px",borderBottom:`1px solid ${C.border}`}}>
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <div style={{width:2,height:12,borderRadius:1,background:color}}/>
+          <Mono color={C.text} size="0.8rem" weight={700}>{trade.symbol}</Mono>
+          <Badge color={rColors[trade.exitReason]||C.muted2}>{trade.exitReason}</Badge>
+        </div>
+        <div style={{marginLeft:8,marginTop:2,fontSize:"0.6rem",color:C.muted,fontFamily:C.mono}}>
+          {dateStr} · {trade.solSpent?.toFixed(4)} SOL in
+        </div>
+      </div>
+      <div style={{textAlign:"right"}}>
+        <div style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono}}>ENTRY</div>
+        <Mono color={C.muted2} size="0.65rem">${trade.entryPrice?.toFixed(6)}</Mono>
+      </div>
+      <div style={{textAlign:"right"}}>
+        <div style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono}}>EXIT</div>
+        <Mono color={C.muted2} size="0.65rem">${trade.exitPrice?.toFixed(6)}</Mono>
+      </div>
+      <PnlBadge pct={trade.pnlPct} sol={trade.pnlSol}/>
+    </div>
+  );
+}
+
+// ── Notification toast ────────────────────────────────────────────────────────
+function NotifToast({ notif, onDismiss }) {
+  const colors = {success:C.green,error:C.red,warn:C.warn,queue:C.accent,info:C.info};
+  const color = colors[notif.type]||C.muted2;
+  return (
+    <div style={{display:"flex",alignItems:"flex-start",gap:8,padding:"7px 9px",
+      background:C.surface,border:`1px solid ${color}33`,
+      borderLeft:`3px solid ${color}`,borderRadius:4,
+      animation:"slideInRight 0.2s ease",marginBottom:4}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:"0.67rem",color:C.text,lineHeight:1.5}}>{notif.msg}</div>
+        <div style={{fontSize:"0.57rem",color:C.muted,fontFamily:C.mono,marginTop:1}}>{notif.ts}</div>
+      </div>
+      <button onClick={()=>onDismiss(notif.id)}
+        style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:"0.7rem",padding:"0 2px"}}>✕</button>
+    </div>
+  );
+}
+
+// ─── MAIN EXPORT ─────────────────────────────────────────────────────────────
+export function TradingPanel({ trading, solBalance }) {
+  const [activeTab, setActiveTab] = useState("queue");
+  const {
+    settings, updateSettings,
+    queue, positions, history,
+    executing, notifications, dismissNotif,
+    executeBuy, executeSell,
+    removeFromQueue,
+    stats, connected, walletAddress,
+  } = trading;
+
+  const tabs = [
+    {id:"queue",    label:"QUEUE",     count:queue.length},
+    {id:"positions",label:"POSITIONS", count:positions.length},
+    {id:"history",  label:"HISTORY",   count:history.length},
+    {id:"settings", label:"SETTINGS"},
+  ];
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",background:C.surface,
+      border:`1px solid ${C.border}`,borderRadius:8,overflow:"hidden",fontFamily:C.sans}}>
+
+      <style>{`
+        @keyframes expandIn    {from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+        @keyframes slideInRight{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:none}}
+        @keyframes pulse       {0%,100%{opacity:1}50%{opacity:0.4}}
+        input[type=number]::-webkit-inner-spin-button{opacity:0.4}
+        input:focus{outline:none}
+      `}</style>
+
+      <WalletBar connected={connected} walletAddress={walletAddress} solBalance={solBalance}/>
+      <StatsBar stats={stats}/>
+
+      {/* Tab bar */}
+      <div style={{display:"flex",background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
+        {tabs.map(tab=>(
+          <button key={tab.id} onClick={()=>setActiveTab(tab.id)} style={{
+            flex:1,padding:"8px 4px",background:"none",border:"none",
+            borderBottom:`2px solid ${activeTab===tab.id?C.accent:"transparent"}`,
+            color:activeTab===tab.id?C.accent:C.muted,
+            fontSize:"0.58rem",fontFamily:C.mono,fontWeight:700,
+            letterSpacing:"0.08em",cursor:"pointer",transition:"all 0.15s",marginBottom:-1,
+          }}>
+            {tab.label}
+            {tab.count>0&&(
+              <span style={{marginLeft:4,
+                background:activeTab===tab.id?C.accent+"33":C.border,
+                color:activeTab===tab.id?C.accent:C.muted2,
+                padding:"1px 5px",borderRadius:8,fontSize:"0.55rem"}}>
+                {tab.count}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Content */}
+      <div style={{flex:1,overflowY:"auto",maxHeight:560}}>
+
+        {activeTab==="queue"&&(
+          queue.length===0 ? (
+            <div style={{padding:"44px 20px",textAlign:"center"}}>
+              <div style={{fontSize:"1.8rem",opacity:0.1,marginBottom:10}}>◎</div>
+              <Mono color={C.muted} size="0.72rem">No tokens in queue</Mono>
+              <div style={{fontSize:"0.62rem",color:C.muted,marginTop:8,lineHeight:1.8}}>
+                Tokens meeting your criteria will appear here.<br/>Run a scan to populate the queue.
+              </div>
+            </div>
+          ) : (
+            <>
+              <div style={{padding:"6px 14px",background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
+                <div style={{fontSize:"0.6rem",color:C.muted2,lineHeight:1.6}}>
+                  Review each token before buying. Edit stake, TP and SL per trade.
+                  {settings.autoExecute&&<span style={{color:C.warn}}> ⚠ AUTO-EXECUTE ON</span>}
+                </div>
+              </div>
+              {queue.map(item=>(
+                <QueueItem key={item.id} item={item}
+                  onApprove={executeBuy} onDismiss={removeFromQueue}
+                  executing={executing} connected={connected}/>
+              ))}
+            </>
+          )
+        )}
+
+        {activeTab==="positions"&&(
+          positions.length===0 ? (
+            <div style={{padding:"44px 20px",textAlign:"center"}}>
+              <div style={{fontSize:"1.8rem",opacity:0.1,marginBottom:10}}>◎</div>
+              <Mono color={C.muted} size="0.72rem">No open positions</Mono>
+            </div>
+          ) : (
+            <>
+              <div style={{padding:"6px 14px",background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
+                <div style={{fontSize:"0.6rem",color:C.muted2}}>Prices refresh every 15s · TP/SL fires automatically</div>
+              </div>
+              {positions.map(pos=>(
+                <PositionCard key={pos.id} position={pos}
+                  onSell={executeSell} executing={executing} connected={connected}/>
+              ))}
+            </>
+          )
+        )}
+
+        {activeTab==="history"&&(
+          history.length===0 ? (
+            <div style={{padding:"44px 20px",textAlign:"center"}}>
+              <div style={{fontSize:"1.8rem",opacity:0.1,marginBottom:10}}>◎</div>
+              <Mono color={C.muted} size="0.72rem">No closed trades yet</Mono>
+            </div>
+          ) : (
+            <>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",
+                padding:"10px 14px",gap:10,background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
+                {[
+                  {l:"TRADES",  v:stats.tradeCount,                                        c:C.text2},
+                  {l:"WIN RATE",v:stats.winRate?.toFixed(0)+"%",                           c:stats.winRate>=50?C.green:C.red},
+                  {l:"AVG PnL", v:(stats.totalPnlPct>=0?"+":"")+stats.totalPnlPct?.toFixed(1)+"%", c:stats.totalPnlPct>=0?C.green:C.red},
+                ].map(s=>(
+                  <div key={s.l} style={{textAlign:"center"}}>
+                    <Mono color={s.c} size="0.9rem" weight={700}>{s.v}</Mono>
+                    <div style={{fontSize:"0.55rem",color:C.muted,fontFamily:C.mono,letterSpacing:"0.08em",marginTop:2}}>{s.l}</div>
+                  </div>
+                ))}
+              </div>
+              {history.map(trade=><HistoryRow key={trade.id} trade={trade}/>)}
+            </>
+          )
+        )}
+
+        {activeTab==="settings"&&(
+          <div style={{padding:14}}>
+            <SettingsPanel settings={settings} updateSettings={updateSettings}/>
+            <div style={{marginTop:12,background:C.surface2,border:`1px solid ${C.border}`,
+              borderRadius:6,padding:12}}>
+              <div style={{fontSize:"0.62rem",color:C.muted,fontFamily:C.mono,
+                letterSpacing:"0.08em",marginBottom:8}}>ACTIVE CRITERIA SUMMARY</div>
+              {[
+                ["Min score",        settings.minScore+"+ / 100"],
+                ["Min confidence",   settings.minConfidence+"%"],
+                ["Momentum filter",  settings.requireMomentum?"EARLY MOMENTUM / UPTREND":"Any signal"],
+                ["Max positions",    settings.maxPositions],
+                ["Cooldown",         settings.cooldownMinutes+"min per token"],
+                ["Slippage",         (settings.slippageBps/100).toFixed(1)+"%"],
+                ["Auto-execute",     settings.autoExecute?"⚠ ENABLED":"OFF — manual approval"],
+              ].map(([k,v])=>(
+                <div key={k} style={{display:"flex",justifyContent:"space-between",
+                  padding:"5px 0",borderBottom:`1px solid ${C.border}`}}>
+                  <span style={{fontSize:"0.65rem",color:C.muted2}}>{k}</span>
+                  <Mono color={k==="Auto-execute"&&settings.autoExecute?C.warn:C.accent}
+                    size="0.65rem" weight={600}>{v}</Mono>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Activity log */}
+      {notifications.length>0&&(
+        <div style={{padding:"8px 10px",borderTop:`1px solid ${C.border}`,
+          background:C.surface2,maxHeight:180,overflowY:"auto"}}>
+          <div style={{fontSize:"0.57rem",color:C.muted,fontFamily:C.mono,
+            letterSpacing:"0.08em",marginBottom:5}}>ACTIVITY LOG</div>
+          {notifications.slice(0,5).map(n=>(
+            <NotifToast key={n.id} notif={n} onDismiss={dismissNotif}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
