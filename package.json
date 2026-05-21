@@ -6,7 +6,7 @@
   "packageManager": "npm@11",
   "scripts": {
     "dev": "vite",
-    "build": "npx vite build",
+    "build": "node ./node_modules/vite/bin/vite.js build",
     "vercel-build": "npm run build",
     "lint": "eslint .",
     "preview": "vite preview"
