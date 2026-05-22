@@ -5,6 +5,7 @@
     { "src": "api/**/*.js", "use": "@vercel/node" }
   ],
   "routes": [
+    { "src": "/api/jup/(.*)", "dest": "/api/jup.js" },
     { "src": "/api/(.*)", "dest": "/api/$1.js" },
     { "handle": "filesystem" },
     { "src": "/.*", "dest": "/index.html" }
