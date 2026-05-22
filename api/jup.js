@@ -1,4 +1,4 @@
-const TARGET_BASE = "https://quote-api.jup.ag/v6";
+const TARGET_BASE = "https://quote-api.jup.ag";
 
 function getRawBody(req) {
   return new Promise((resolve, reject) => {
