@@ -13,6 +13,7 @@ export default async function handler(req, res) {
   try {
     const targetPath = req.url.replace(/^\/api\/jup/, "") || "/";
     const targetUrl = `${TARGET_BASE}${targetPath}`;
+    console.log(`[jup proxy] ${req.method} ${req.url} -> ${targetUrl}`);
     const headers = { ...req.headers };
     delete headers.host;
     delete headers["content-length"];
@@ -30,6 +31,7 @@ export default async function handler(req, res) {
       body,
     });
 
+    console.log(`[jup proxy] response status: ${response.status}`);
     res.status(response.status);
     response.headers.forEach((value, key) => {
       if (["transfer-encoding", "content-encoding", "connection"].includes(key)) return;
