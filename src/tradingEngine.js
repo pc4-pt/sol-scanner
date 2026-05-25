@@ -1,152 +1,224 @@
 // ─── tradingEngine.js ─────────────────────────────────────────────────────────
-// Jupiter v6 swap integration + position lifecycle management
-// All monetary values in SOL (lamports converted at call site)
+// Jupiter Swap API v2 — routed through /api/jupiter (Vercel serverless proxy).
+// The API key lives in server-side env var JUPITER_API_KEY — never in the browser.
 
-import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import {
+  VersionedTransaction,
+  TransactionMessage,
+  PublicKey,
+} from "@solana/web3.js";
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-export const SOL_MINT   = "So11111111111111111111111111111111111111112";
-export const USDC_MINT  = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-export const JUPITER_API = import.meta.env?.VITE_JUPITER_API || (import.meta.env?.DEV ? "/jup/v6" : "/api/jup/v6");
-export const RPC_ENDPOINT = "https://api.mainnet-beta.solana.com";
-export const JUPITER_RETRY_COUNT = 3;
-export const JUPITER_RETRY_DELAY_MS = 900;
-export const JUPITER_RETRY_STATUS = [429, 502, 503, 504];
-
-// Price monitor poll interval (ms) — checks open positions
+export const SOL_MINT      = "So11111111111111111111111111111111111111112";
 export const PRICE_POLL_MS = 15000;
 
-async function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// ── Proxy URL builder ─────────────────────────────────────────────────────────
+// In dev (Vite): /api/jupiter is forwarded by vite.config.js proxy to the fn
+// In production (Vercel): /api/jupiter is the serverless function in /api/jupiter.js
+function jupiterProxyUrl(jupiterPath, params = {}) {
+  const url = new URL("/api/jupiter", window.location.origin);
+  url.searchParams.set("path", jupiterPath);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, String(v)));
+  return url.toString();
 }
 
-async function fetchWithRetry(url, options = {}, retries = JUPITER_RETRY_COUNT) {
-  let attempt = 0;
-  while (true) {
-    try {
-      const res = await fetch(url, options);
-      if (res.ok) return res;
-      if (attempt < retries && JUPITER_RETRY_STATUS.includes(res.status)) {
-        const backoff = JUPITER_RETRY_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
-        await delay(backoff);
-        attempt += 1;
-        continue;
-      }
-      throw new Error(`HTTP ${res.status}`);
-    } catch (err) {
-      const message = err?.message || "network error";
-      const retryable = attempt < retries && (
-        message.includes("Failed to fetch") ||
-        message.includes("network") ||
-        JUPITER_RETRY_STATUS.some(code => message.includes(String(code)))
-      );
-      if (retryable) {
-        const backoff = JUPITER_RETRY_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
-        await delay(backoff);
-        attempt += 1;
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-
-// ── Connection ────────────────────────────────────────────────────────────────
-export function getConnection() {
-  return new Connection(RPC_ENDPOINT, "confirmed");
-}
-
-// ── Jupiter: get quote ────────────────────────────────────────────────────────
-// inputMint:  what you're spending (SOL_MINT to buy a token)
-// outputMint: what you're buying   (token mint address)
-// amountLamports: amount in lamports (1 SOL = 1_000_000_000)
-// slippageBps: slippage tolerance in basis points (100 = 1%)
-export async function getJupiterQuote({ inputMint, outputMint, amountLamports, slippageBps = 150 }) {
-  const params = new URLSearchParams({
+// ── GET /swap/v2/build ────────────────────────────────────────────────────────
+// Returns quote + all raw instructions needed to build the swap transaction.
+export async function getJupiterBuild({
+  inputMint,
+  outputMint,
+  amountLamports,
+  takerPublicKey,
+  slippageBps = 200,
+}) {
+  const url = jupiterProxyUrl("swap/v2/build", {
     inputMint,
     outputMint,
-    amount: String(amountLamports),
-    slippageBps: String(slippageBps),
-    onlyDirectRoutes: "false",
+    amount:                     amountLamports,
+    taker:                      takerPublicKey.toString(),
+    slippageBps,
+    computeUnitPricePercentile: "high",
+    wrapAndUnwrapSol:           "true",
   });
-  const url = `${JUPITER_API}/quote?${params.toString()}`;
-  let res;
-  try {
-    res = await fetchWithRetry(url, { mode: "cors", credentials: "omit" });
-  } catch (err) {
-    throw new Error(`Jupiter quote failed: ${err?.message || "network error"}`);
+
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => String(res.status));
+    // Surface the exact Jupiter error message for easy debugging
+    throw new Error(`Jupiter /build failed (${res.status}): ${body}`);
   }
-  const payload = await res.json();
-  if (!payload || typeof payload !== "object") throw new Error("Invalid Jupiter quote response");
-  return payload;
+
+  return res.json();
 }
 
-// ── Jupiter: get swap transaction ─────────────────────────────────────────────
-export async function getJupiterSwapTx({ quoteResponse, userPublicKey, wrapUnwrapSOL = true }) {
-  let res;
-  try {
-    res = await fetchWithRetry(`${JUPITER_API}/swap`, {
-      method: "POST",
-      mode: "cors",
-      credentials: "omit",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        quoteResponse,
-        userPublicKey: userPublicKey.toString(),
-        wrapAndUnwrapSol: wrapUnwrapSOL,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: "auto",
-      }),
-    });
-  } catch (err) {
-    throw new Error(`Jupiter swap failed: ${err?.message || "network error"}`);
+// ── Assemble VersionedTransaction from raw instructions ───────────────────────
+// /build returns discrete instruction objects; we compose them into a v0 tx.
+export async function assembleTransaction({ build, connection, payerPublicKey }) {
+  const {
+    computeBudgetInstructions = [],
+    setupInstructions         = [],
+    swapInstruction,
+    cleanupInstruction,
+    otherInstructions         = [],
+    addressesByLookupTableAddress,
+  } = build;
+
+  // Convert Jupiter's instruction format → @solana/web3.js format
+  function toWeb3Ix(ix) {
+    return {
+      programId: new PublicKey(ix.programId),
+      keys: ix.accounts.map(acc => ({
+        pubkey:     new PublicKey(acc.pubkey),
+        isSigner:   acc.isSigner,
+        isWritable: acc.isWritable,
+      })),
+      // ix.data is base64-encoded in the /build response
+      data: Buffer.from(ix.data, "base64"),
+    };
   }
-  const json = await res.json();
-  if (!json?.swapTransaction) throw new Error("Invalid Jupiter swap response");
-  return json.swapTransaction; // base64-encoded VersionedTransaction
+
+  const allIxs = [
+    ...computeBudgetInstructions.map(toWeb3Ix),
+    ...setupInstructions.map(toWeb3Ix),
+    toWeb3Ix(swapInstruction),
+    ...(cleanupInstruction ? [toWeb3Ix(cleanupInstruction)] : []),
+    ...otherInstructions.map(toWeb3Ix),
+  ];
+
+  // Fresh blockhash
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+
+  // Load address lookup tables (needed for v0 transactions)
+  let lookupTableAccounts = [];
+  if (addressesByLookupTableAddress) {
+    const entries = await Promise.all(
+      Object.keys(addressesByLookupTableAddress).map(async (addr) => {
+        const result = await connection.getAddressLookupTable(new PublicKey(addr));
+        return result.value;
+      })
+    );
+    lookupTableAccounts = entries.filter(Boolean);
+  }
+
+  const messageV0 = new TransactionMessage({
+    payerKey:        payerPublicKey,
+    recentBlockhash: blockhash,
+    instructions:    allIxs,
+  }).compileToV0Message(lookupTableAccounts);
+
+  return new VersionedTransaction(messageV0);
 }
 
-// ── Execute swap via connected wallet ────────────────────────────────────────
-// signTransaction: from useWallet() wallet adapter
-export async function executeSwap({ swapTransactionBase64, signTransaction, connection }) {
-  const txBuf = Buffer.from(swapTransactionBase64, "base64");
-  const tx = VersionedTransaction.deserialize(txBuf);
-  const signed = await signTransaction(tx);
-  const rawTx = signed.serialize();
+// ── Sign and send via wallet adapter ─────────────────────────────────────────
+export async function signAndSend({ transaction, signTransaction, connection }) {
+  // Triggers Phantom / Solflare approval popup
+  const signed = await signTransaction(transaction);
+  const rawTx  = signed.serialize();
+
   const sig = await connection.sendRawTransaction(rawTx, {
-    skipPreflight: false,
-    maxRetries: 3,
+    skipPreflight:       false,
+    maxRetries:          3,
+    preflightCommitment: "confirmed",
   });
-  // Wait for confirmation
-  const latestBlockhash = await connection.getLatestBlockhash();
-  await connection.confirmTransaction({ signature: sig, ...latestBlockhash }, "confirmed");
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  const result = await connection.confirmTransaction(
+    { signature: sig, blockhash, lastValidBlockHeight },
+    "confirmed"
+  );
+
+  if (result.value.err) {
+    throw new Error(`Transaction failed on-chain: ${JSON.stringify(result.value.err)}`);
+  }
+
   return sig;
 }
 
-// ── Fetch current token price via DexScreener ────────────────────────────────
+// ── Full buy: build → assemble → sign → send ─────────────────────────────────
+export async function executeBuySwap({
+  inputMint,
+  outputMint,
+  amountLamports,
+  slippageBps,
+  publicKey,
+  signTransaction,
+  connection,
+}) {
+  const build = await getJupiterBuild({
+    inputMint,
+    outputMint,
+    amountLamports,
+    takerPublicKey: publicKey,
+    slippageBps,
+  });
+
+  const priceImpact = parseFloat(build.priceImpactPct || 0);
+  if (priceImpact > 5) {
+    throw new Error(`Price impact too high: ${priceImpact.toFixed(2)}% — trade cancelled (limit 5%)`);
+  }
+
+  const tx = await assembleTransaction({ build, connection, payerPublicKey: publicKey });
+  const sig = await signAndSend({ transaction: tx, signTransaction, connection });
+
+  return {
+    sig,
+    outAmount:   parseInt(build.outAmount || 0),
+    priceImpact,
+    inAmountSol: amountLamports / 1_000_000_000,
+  };
+}
+
+// ── Full sell: build → assemble → sign → send ────────────────────────────────
+export async function executeSellSwap({
+  tokenMint,
+  tokenAmount,
+  slippageBps,
+  publicKey,
+  signTransaction,
+  connection,
+}) {
+  const build = await getJupiterBuild({
+    inputMint:      tokenMint,
+    outputMint:     SOL_MINT,
+    amountLamports: tokenAmount,
+    takerPublicKey: publicKey,
+    slippageBps,
+  });
+
+  const tx = await signAndSend({
+    transaction: await assembleTransaction({ build, connection, payerPublicKey: publicKey }),
+    signTransaction,
+    connection,
+  });
+
+  return {
+    sig:         tx,
+    solReceived: parseInt(build.outAmount || 0) / 1_000_000_000,
+  };
+}
+
+// ── Fetch current token price from DexScreener ───────────────────────────────
 export async function fetchCurrentPrice(tokenAddress) {
   try {
-    const res = await fetchWithRetry(`https://api.dexscreener.com/tokens/v1/solana/${tokenAddress}`, {
-      mode: "cors",
-      credentials: "omit",
-    }, 2);
+    const res = await fetch(
+      `https://api.dexscreener.com/tokens/v1/solana/${tokenAddress}`
+    );
     if (!res.ok) return null;
     const pairs = await res.json();
-    if (!Array.isArray(pairs) || pairs.length === 0) return null;
-    // Use highest-liquidity pair
-    const best = pairs.sort((a, b) =>
-      parseFloat(b.liquidity?.usd || 0) - parseFloat(a.liquidity?.usd || 0)
+    if (!Array.isArray(pairs) || !pairs.length) return null;
+    const best = pairs.sort(
+      (a, b) => parseFloat(b.liquidity?.usd || 0) - parseFloat(a.liquidity?.usd || 0)
     )[0];
-    return parseFloat(best.priceUsd || 0);
+    return parseFloat(best.priceUsd || 0) || null;
   } catch {
     return null;
   }
 }
 
-// ── Position status helpers ───────────────────────────────────────────────────
+// ── PnL helpers ───────────────────────────────────────────────────────────────
 export function calcPnl(position, currentPrice) {
   if (!position.entryPrice || !currentPrice) return null;
-  const pct = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+  const pct    = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
   const solPnl = (position.solSpent || 0) * (pct / 100);
   return { pct: parseFloat(pct.toFixed(2)), solPnl: parseFloat(solPnl.toFixed(6)) };
 }
@@ -154,21 +226,20 @@ export function calcPnl(position, currentPrice) {
 export function shouldTriggerExit(position, currentPrice) {
   if (!currentPrice || !position.entryPrice) return null;
   const pct = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
-  if (pct <= -Math.abs(position.stopLossPct))  return { reason: "STOP_LOSS",   pct };
+  if (pct <= -Math.abs(position.stopLossPct))   return { reason: "STOP_LOSS",   pct };
   if (pct >=  Math.abs(position.takeProfitPct)) return { reason: "TAKE_PROFIT", pct };
   return null;
 }
 
-// ── Default trade settings ────────────────────────────────────────────────────
 export const DEFAULT_TRADE_SETTINGS = {
-  stakeSOL:        0.1,    // SOL per trade
-  takeProfitPct:   50,     // +50% exit
-  stopLossPct:     20,     // -20% exit
-  slippageBps:     200,    // 2% slippage tolerance
-  maxPositions:    5,      // concurrent open positions
-  minScore:        70,     // minimum scanner score to queue
-  minConfidence:   60,     // minimum momentum confidence %
-  requireMomentum: true,   // must have EARLY MOMENTUM or UPTREND signal
-  cooldownMinutes: 30,     // don't re-enter same token within X min
-  autoExecute:     false,  // manual approval required by default
+  stakeSOL:        0.1,
+  takeProfitPct:   50,
+  stopLossPct:     20,
+  slippageBps:     200,
+  maxPositions:    5,
+  minScore:        70,
+  minConfidence:   60,
+  requireMomentum: true,
+  cooldownMinutes: 30,
+  autoExecute:     false,
 };
