@@ -1,21 +1,45 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// https://vite.dev/config/
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    proxy: {
-      '/api': {
-        target: 'https://api.dexscreener.com',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ''),
-      },
-      '/jup': {
-        target: 'https://quote-api.jup.ag',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/jup/, ''),
+export default defineConfig(({ mode }) => {
+  // Load .env so we can read JUPITER_API_KEY in the dev proxy
+  const env = loadEnv(mode, process.cwd(), '')
+
+  return {
+    plugins: [react()],
+    server: {
+      proxy: {
+        // DexScreener — avoids CORS in dev
+        '/api/dex': {
+          target: 'https://api.dexscreener.com',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api\/dex/, ''),
+        },
+        // Jupiter proxy — injects API key server-side so it never hits the browser
+        '/api/jupiter': {
+          target: 'https://api.jup.ag',
+          changeOrigin: true,
+          rewrite: (path) => {
+            // /api/jupiter?path=swap/v2/build&... → /swap/v2/build?...
+            return path.replace(/^\/api\/jupiter/, '')
+          },
+          configure: (proxy) => {
+            proxy.on('proxyReq', (proxyReq, req) => {
+              // Inject the API key header server-side
+              const key = env.JUPITER_API_KEY
+              if (key) proxyReq.setHeader('x-api-key', key)
+
+              // Rewrite path: strip /api/jupiter, move ?path= to the URL path
+              const url = new URL(req.url, 'http://localhost')
+              const jupiterPath = url.searchParams.get('path') || ''
+              const remaining = new URLSearchParams(url.searchParams)
+              remaining.delete('path')
+              const newPath = `/${jupiterPath}${remaining.size ? '?' + remaining.toString() : ''}`
+              proxyReq.path = newPath
+            })
+          },
+        },
       },
     },
-  },
+  }
 })
