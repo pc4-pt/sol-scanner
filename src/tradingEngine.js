@@ -65,6 +65,9 @@ export async function assembleTransaction({ build, connection, payerPublicKey })
 
   // Convert Jupiter's instruction format → @solana/web3.js format
   function toWeb3Ix(ix) {
+    // Decode base64 instruction data without Buffer (browser-safe)
+    const binStr = atob(ix.data);
+    const data   = Uint8Array.from(binStr, c => c.charCodeAt(0));
     return {
       programId: new PublicKey(ix.programId),
       keys: ix.accounts.map(acc => ({
@@ -72,8 +75,7 @@ export async function assembleTransaction({ build, connection, payerPublicKey })
         isSigner:   acc.isSigner,
         isWritable: acc.isWritable,
       })),
-      // ix.data is base64-encoded in the /build response
-      data: Buffer.from(ix.data, "base64"),
+      data,
     };
   }
 
