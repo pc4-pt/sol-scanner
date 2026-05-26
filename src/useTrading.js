@@ -2,50 +2,61 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import {
-  getJupiterQuote, getJupiterSwapTx, executeSwap,
+  executeBuySwap, executeSellSwap,
   fetchCurrentPrice, calcPnl, shouldTriggerExit,
   DEFAULT_TRADE_SETTINGS, SOL_MINT, PRICE_POLL_MS,
 } from "./tradingEngine.js";
 
-// ── Storage helpers ───────────────────────────────────────────────────────────
-const KEYS = { positions: "solscanner_positions", history: "solscanner_history", settings: "solscanner_settings" };
+// ── Storage ───────────────────────────────────────────────────────────────────
+const KEYS = {
+  positions: "solscanner_positions",
+  history:   "solscanner_history",
+  settings:  "solscanner_settings",
+};
 function load(key, fallback) {
-  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
+  catch { return fallback; }
 }
-function save(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
+function save(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
 export function useTrading() {
   const { publicKey, signTransaction, connected } = useWallet();
   const { connection } = useConnection();
 
-  const [settings,  setSettingsState] = useState(() => load(KEYS.settings,  DEFAULT_TRADE_SETTINGS));
-  const [queue,     setQueue]         = useState([]);
-  const [positions, setPositions]     = useState(() => load(KEYS.positions, []));
-  const [history,   setHistory]       = useState(() => load(KEYS.history,   []));
-  const [executing, setExecuting]     = useState({});
+  const [settings,      setSettings]  = useState(() => load(KEYS.settings,  DEFAULT_TRADE_SETTINGS));
+  const [queue,         setQueue]     = useState([]);
+  const [positions,     setPositions] = useState(() => load(KEYS.positions, []));
+  const [history,       setHistory]   = useState(() => load(KEYS.history,   []));
+  const [executing,     setExecuting] = useState({});
   const [notifications, setNotifs]   = useState([]);
 
-  const priceMonitorRef = useRef(null);
-  const cooldownRef     = useRef({});  // tokenAddress -> timestamp of last trade
-  // FIX 1: track queued addresses in a ref so addToQueue always sees fresh state
-  // without needing queue in its dependency array (which caused stale-closure dupes)
-  const queuedAddrsRef  = useRef(new Set());
+  const priceMonitorRef  = useRef(null);
+  const cooldownRef      = useRef({});
+  // Refs to track queued/open state synchronously (avoids stale-closure duplicates)
+  const queuedAddrsRef   = useRef(new Set());
   const positionAddrsRef = useRef(new Set(
     positions.filter(p => p.status === "open").map(p => p.tokenAddress)
   ));
 
+  // Persist to localStorage
   useEffect(() => { save(KEYS.positions, positions); }, [positions]);
   useEffect(() => { save(KEYS.history,   history);   }, [history]);
   useEffect(() => { save(KEYS.settings,  settings);  }, [settings]);
 
   const updateSettings = useCallback((patch) => {
-    setSettingsState(prev => ({ ...prev, ...patch }));
+    setSettings(prev => ({ ...prev, ...patch }));
   }, []);
 
   // ── Notifications ─────────────────────────────────────────────────────────
   const notify = useCallback((msg, type = "info") => {
-    const n = { id: Date.now() + Math.random(), msg, type, ts: new Date().toLocaleTimeString() };
+    const n = {
+      id:  Date.now() + Math.random(),
+      msg, type,
+      ts:  new Date().toLocaleTimeString(),
+    };
     setNotifs(prev => [n, ...prev].slice(0, 20));
   }, []);
 
@@ -53,22 +64,21 @@ export function useTrading() {
     setNotifs(prev => prev.filter(n => n.id !== id));
   }, []);
 
-  // ── Queue management ──────────────────────────────────────────────────────
+  // ── Queue ─────────────────────────────────────────────────────────────────
   const addToQueue = useCallback((token, signal) => {
-    const addr       = token.baseToken?.address;
-    const pairAddr   = token.pairAddress;
+    const addr     = token.baseToken?.address;
+    const pairAddr = token.pairAddress;
     if (!addr || !pairAddr) return;
 
-    // Cooldown check
-    const lastTrade = cooldownRef.current[addr];
-    if (lastTrade && Date.now() - lastTrade < settings.cooldownMinutes * 60000) return;
+    // Cooldown gate
+    const last = cooldownRef.current[addr];
+    if (last && Date.now() - last < settings.cooldownMinutes * 60000) return;
 
-    // FIX 1: use refs so we always have fresh data, not stale closure values
-    if (queuedAddrsRef.current.has(pairAddr))  return;  // already in queue
-    if (positionAddrsRef.current.has(addr))    return;  // already have open position
+    // Synchronous dedup via refs
+    if (queuedAddrsRef.current.has(pairAddr))  return;
+    if (positionAddrsRef.current.has(addr))    return;
 
-    // Mark as queued immediately in the ref to prevent race-condition duplicates
-    queuedAddrsRef.current.add(pairAddr);
+    queuedAddrsRef.current.add(pairAddr); // mark immediately
 
     const entry = {
       id:            `q_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
@@ -87,9 +97,8 @@ export function useTrading() {
     };
 
     setQueue(prev => {
-      // Double-check in state too — belt and braces
       if (prev.some(q => q.pairAddress === pairAddr)) {
-        queuedAddrsRef.current.delete(pairAddr); // undo the ref add
+        queuedAddrsRef.current.delete(pairAddr);
         return prev;
       }
       notify(`${entry.symbol} added to queue (score ${entry.score})`, "queue");
@@ -122,56 +131,27 @@ export function useTrading() {
       return;
     }
 
-    // Prevent double-tap
-    let alreadyExecuting = false;
+    // Guard against double-tap
     setExecuting(prev => {
-      if (prev[queueItem.id]) {
-        alreadyExecuting = true;
-        return prev;
-      }
+      if (prev[queueItem.id]) return prev;
       return { ...prev, [queueItem.id]: true };
     });
-    if (alreadyExecuting) return;
 
     notify(`Getting quote for ${queueItem.symbol}…`, "info");
 
     try {
-      const lamports    = Math.round(queueItem.stakeSOL * 1_000_000_000);
-      const inAmountSol = lamports / 1_000_000_000;
+      const lamports = Math.round(queueItem.stakeSOL * 1_000_000_000);
 
-      // 1. Quote
-      const quote = await getJupiterQuote({
+      const { sig, outAmount, priceImpact, inAmountSol } = await executeBuySwap({
         inputMint:      SOL_MINT,
         outputMint:     queueItem.tokenAddress,
         amountLamports: lamports,
         slippageBps:    settings.slippageBps,
-      });
-
-      const outAmount   = parseInt(quote.outAmount || 0);
-      const priceImpact = parseFloat(quote.priceImpactPct || 0);
-
-      if (priceImpact > 5) {
-        notify(`⚠ Price impact too high (${priceImpact.toFixed(1)}%) — trade cancelled`, "warn");
-        setExecuting(prev => ({ ...prev, [queueItem.id]: false }));
-        return;
-      }
-
-      notify(`Signing transaction for ${queueItem.symbol}…`, "info");
-
-      // 2. Build swap tx
-      const swapTxBase64 = await getJupiterSwapTx({
-        quoteResponse: quote,
-        userPublicKey: publicKey,
-      });
-
-      // 3. Sign + send (triggers wallet popup)
-      const sig = await executeSwap({
-        swapTransactionBase64: swapTxBase64,
+        publicKey,
         signTransaction,
         connection,
       });
 
-      // 4. Record position
       const position = {
         id:             `pos_${Date.now()}`,
         pairAddress:    queueItem.pairAddress,
@@ -194,20 +174,18 @@ export function useTrading() {
         pnlSol:         0,
       };
 
-      // Update position tracking ref
       positionAddrsRef.current.add(queueItem.tokenAddress);
       queuedAddrsRef.current.delete(queueItem.pairAddress);
+      cooldownRef.current[queueItem.tokenAddress] = Date.now();
 
       setPositions(prev => [position, ...prev]);
       setQueue(prev => prev.filter(q => q.id !== queueItem.id));
-      cooldownRef.current[queueItem.tokenAddress] = Date.now();
 
-      notify(`✓ Bought ${queueItem.symbol} — ${sig.slice(0,8)}…`, "success");
+      notify(`✓ Bought ${queueItem.symbol} · impact ${priceImpact.toFixed(2)}% · tx ${sig.slice(0,8)}…`, "success");
 
     } catch (err) {
       const msg = err?.message || String(err);
-      const detail = msg.includes("Failed to fetch") ? `${msg} (network/CORS issue?)` : msg;
-      notify(`Buy failed: ${detail}`, "error");
+      notify(`Buy failed: ${msg}`, "error");
       console.error("[executeBuy]", err);
     } finally {
       setExecuting(prev => ({ ...prev, [queueItem.id]: false }));
@@ -220,35 +198,27 @@ export function useTrading() {
       notify("Wallet not connected", "error");
       return;
     }
+    if (!position.tokensReceived || position.tokensReceived <= 0) {
+      notify(`Cannot sell ${position.symbol}: no token amount recorded`, "error");
+      return;
+    }
 
     setExecuting(prev => ({ ...prev, [position.id]: true }));
     notify(`Selling ${position.symbol} (${reason})…`, "info");
 
     try {
-      const tokenAmount = position.tokensReceived;
-      if (!tokenAmount || tokenAmount <= 0) throw new Error("No token amount recorded for this position");
-
-      const quote = await getJupiterQuote({
-        inputMint:      position.tokenAddress,
-        outputMint:     SOL_MINT,
-        amountLamports: tokenAmount,
+      const { sig, solReceived } = await executeSellSwap({
+        tokenMint:      position.tokenAddress,
+        tokenAmount:    position.tokensReceived,
         slippageBps:    settings.slippageBps,
-      });
-
-      const swapTxBase64 = await getJupiterSwapTx({
-        quoteResponse: quote,
-        userPublicKey: publicKey,
-      });
-
-      const sig = await executeSwap({
-        swapTransactionBase64: swapTxBase64,
+        publicKey,
         signTransaction,
         connection,
       });
 
-      const solReceived = parseInt(quote.outAmount || 0) / 1_000_000_000;
-      const pnlSol      = solReceived - position.solSpent;
-      const pnlPct      = (pnlSol / position.solSpent) * 100;
+      const pnlSol = solReceived - position.solSpent;
+      const pnlPct = (pnlSol / position.solSpent) * 100;
+      const sign   = pnlSol >= 0 ? "+" : "";
 
       const closed = {
         ...position,
@@ -266,8 +236,10 @@ export function useTrading() {
       setPositions(prev => prev.filter(p => p.id !== position.id));
       setHistory(prev => [closed, ...prev].slice(0, 100));
 
-      const sign = pnlSol >= 0 ? "+" : "";
-      notify(`${pnlSol >= 0 ? "✓" : "✗"} ${position.symbol} closed (${reason}) — ${sign}${pnlPct.toFixed(1)}% / ${sign}${pnlSol.toFixed(4)} SOL`, pnlSol >= 0 ? "success" : "warn");
+      notify(
+        `${pnlSol >= 0 ? "✓" : "✗"} ${position.symbol} closed (${reason}) — ${sign}${pnlPct.toFixed(1)}% / ${sign}${pnlSol.toFixed(4)} SOL`,
+        pnlSol >= 0 ? "success" : "warn"
+      );
 
     } catch (err) {
       const msg = err?.message || String(err);
@@ -278,12 +250,12 @@ export function useTrading() {
     }
   }, [connected, publicKey, signTransaction, connection, settings, notify]);
 
-  // ── Price monitor ─────────────────────────────────────────────────────────
+  // ── Price monitor (15s interval) ──────────────────────────────────────────
   useEffect(() => {
     if (priceMonitorRef.current) clearInterval(priceMonitorRef.current);
     priceMonitorRef.current = setInterval(async () => {
       const open = positions.filter(p => p.status === "open");
-      if (open.length === 0) return;
+      if (!open.length) return;
       for (const pos of open) {
         try {
           const price = await fetchCurrentPrice(pos.tokenAddress);
@@ -304,11 +276,10 @@ export function useTrading() {
     return () => clearInterval(priceMonitorRef.current);
   }, [positions, executing, executeSell]);
 
-  // ── Auto-queue from scanner results ──────────────────────────────────────
+  // ── Auto-queue from scanner ───────────────────────────────────────────────
   const checkAndQueue = useCallback((tokens, classifyMomentum) => {
     const openCount = positions.filter(p => p.status === "open").length;
     if (openCount >= settings.maxPositions) return;
-
     for (const token of tokens) {
       if ((token._score || 0) < settings.minScore) continue;
       const signal = classifyMomentum(token);
@@ -322,11 +293,15 @@ export function useTrading() {
   // ── Stats ─────────────────────────────────────────────────────────────────
   const stats = {
     openCount:   positions.filter(p => p.status === "open").length,
-    totalPnlSol: history.reduce((s, p) => s + (p.pnlSol || 0), 0),
-    totalPnlPct: history.length ? history.reduce((s, p) => s + (p.pnlPct || 0), 0) / history.length : 0,
-    winRate:     history.length ? (history.filter(p => p.pnlSol > 0).length / history.length) * 100 : 0,
-    tradeCount:  history.length,
     queueCount:  queue.length,
+    totalPnlSol: history.reduce((s, p) => s + (p.pnlSol || 0), 0),
+    totalPnlPct: history.length
+      ? history.reduce((s, p) => s + (p.pnlPct || 0), 0) / history.length
+      : 0,
+    winRate:     history.length
+      ? (history.filter(p => p.pnlSol > 0).length / history.length) * 100
+      : 0,
+    tradeCount: history.length,
   };
 
   return {
