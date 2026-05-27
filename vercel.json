@@ -2,14 +2,10 @@
   "buildCommand": "vite build",
   "outputDirectory": "dist",
   "framework": "vite",
+  "installCommand": "npm install",
   "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": "/api/$1"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/index.html"
-    }
+    { "source": "/api/jupiter/quote", "destination": "/api/jupiter" },
+    { "source": "/api/jupiter/swap",  "destination": "/api/jupiter" },
+    { "source": "/(.*)",              "destination": "/index.html"  }
   ]
 }

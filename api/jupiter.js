@@ -1,66 +1,64 @@
 // api/jupiter.js — Vercel serverless function (CommonJS)
-// Proxies Jupiter Swap API v2 calls, injecting JUPITER_API_KEY server-side.
-// Browser calls /api/jupiter?path=swap/v2/build&inputMint=...
+// Two routes:
+//   GET  /api/jupiter/quote  → proxies GET  api.jup.ag/swap/v1/quote
+//   POST /api/jupiter/swap   → proxies POST api.jup.ag/swap/v1/swap
 
 module.exports = async function handler(req, res) {
-  // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
 
-  // Verify API key is configured
   const apiKey = process.env.JUPITER_API_KEY;
   if (!apiKey) {
-    console.error("[jupiter proxy] JUPITER_API_KEY env var not set");
-    return res.status(500).json({
-      error: "Server configuration error: JUPITER_API_KEY not set.",
-    });
+    return res.status(500).json({ error: "JUPITER_API_KEY not configured on server." });
   }
 
-  // The 'path' param contains the Jupiter endpoint, e.g. 'swap/v2/build'
-  const { path: jupiterPath, ...queryParams } = req.query;
+  // Determine which Jupiter endpoint to call based on the URL path
+  // /api/jupiter/quote  → /swap/v1/quote
+  // /api/jupiter/swap   → /swap/v1/swap
+  const urlPath = req.url || "";
+  let jupiterEndpoint;
 
-  if (!jupiterPath) {
-    return res.status(400).json({ error: "Missing required 'path' query parameter." });
+  if (urlPath.includes("/quote")) {
+    jupiterEndpoint = "https://api.jup.ag/swap/v1/quote";
+  } else if (urlPath.includes("/swap")) {
+    jupiterEndpoint = "https://api.jup.ag/swap/v1/swap";
+  } else {
+    return res.status(400).json({ error: "Unknown Jupiter endpoint. Use /api/jupiter/quote or /api/jupiter/swap" });
   }
-
-  // Build upstream Jupiter URL with all forwarded query params
-  const jupiterUrl = new URL(`https://api.jup.ag/${jupiterPath}`);
-  Object.entries(queryParams).forEach(([k, v]) => {
-    jupiterUrl.searchParams.set(k, Array.isArray(v) ? v[0] : v);
-  });
-
-  console.log(`[jupiter proxy] → ${req.method} ${jupiterUrl.toString()}`);
 
   try {
-    const upstreamRes = await fetch(jupiterUrl.toString(), {
-      method:  req.method,
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key":    apiKey,
-      },
-      body: req.method === "POST" && req.body
-        ? JSON.stringify(req.body)
-        : undefined,
-    });
+    let upstreamRes;
 
-    const responseText = await upstreamRes.text();
+    if (req.method === "GET") {
+      // Forward all query params to Jupiter
+      const params = new URLSearchParams(req.query || {});
+      const url = `${jupiterEndpoint}?${params.toString()}`;
+      console.log(`[jupiter] GET ${url}`);
+      upstreamRes = await fetch(url, {
+        headers: { "x-api-key": apiKey },
+      });
+    } else {
+      // POST — forward JSON body
+      console.log(`[jupiter] POST ${jupiterEndpoint}`);
+      upstreamRes = await fetch(jupiterEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+        },
+        body: JSON.stringify(req.body || {}),
+      });
+    }
 
-    console.log(`[jupiter proxy] ← ${upstreamRes.status}`);
-
-    return res
-      .status(upstreamRes.status)
-      .setHeader("Content-Type", "application/json")
-      .send(responseText);
+    const text = await upstreamRes.text();
+    console.log(`[jupiter] response ${upstreamRes.status}`);
+    return res.status(upstreamRes.status).setHeader("Content-Type", "application/json").send(text);
 
   } catch (err) {
-    console.error("[jupiter proxy] fetch error:", err);
-    return res.status(502).json({
-      error: `Upstream Jupiter request failed: ${err.message}`,
-    });
+    console.error("[jupiter] error:", err.message);
+    return res.status(502).json({ error: err.message });
   }
 };
