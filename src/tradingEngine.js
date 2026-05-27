@@ -8,52 +8,40 @@ import { VersionedTransaction } from "@solana/web3.js";
 export const SOL_MINT      = "So11111111111111111111111111111111111111112";
 export const PRICE_POLL_MS = 15000;
 
-// ── Step 1: GET /api/jupiter/quote ────────────────────────────────────────────
+// ── Step 1: GET /api/quote ────────────────────────────────────────────────────
 export async function getQuote({ inputMint, outputMint, amountLamports, slippageBps = 200 }) {
   const params = new URLSearchParams({
     inputMint,
     outputMint,
-    amount:      String(amountLamports),
-    slippageBps: String(slippageBps),
+    amount:           String(amountLamports),
+    slippageBps:      String(slippageBps),
     onlyDirectRoutes: "false",
   });
 
-  const res = await fetch(`/api/jupiter/quote?${params.toString()}`);
+  const res  = await fetch(`/api/quote?${params.toString()}`);
   const data = await res.json();
-
-  if (!res.ok) {
-    throw new Error(`Jupiter quote failed (${res.status}): ${data?.error || JSON.stringify(data)}`);
-  }
-  if (data.error) {
-    throw new Error(`Jupiter quote error: ${data.error}`);
-  }
-  return data; // quoteResponse
+  if (!res.ok) throw new Error(`Jupiter quote failed (${res.status}): ${data?.error || JSON.stringify(data)}`);
+  if (data.error) throw new Error(`Jupiter quote error: ${data.error}`);
+  return data;
 }
 
-// ── Step 2: POST /api/jupiter/swap ────────────────────────────────────────────
-// Returns a base64-encoded serialized VersionedTransaction ready to sign.
+// ── Step 2: POST /api/swap ────────────────────────────────────────────────────
 export async function getSwapTransaction({ quoteResponse, userPublicKey }) {
-  const res = await fetch("/api/jupiter/swap", {
+  const res = await fetch("/api/swap", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       quoteResponse,
-      userPublicKey:              userPublicKey.toString(),
-      wrapAndUnwrapSol:           true,
-      dynamicComputeUnitLimit:    true,
-      prioritizationFeeLamports:  "auto",
+      userPublicKey:           userPublicKey.toString(),
+      wrapAndUnwrapSol:        true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: "auto",
     }),
   });
-
   const data = await res.json();
-
-  if (!res.ok) {
-    throw new Error(`Jupiter swap failed (${res.status}): ${data?.error || JSON.stringify(data)}`);
-  }
-  if (!data.swapTransaction) {
-    throw new Error(`Jupiter returned no swapTransaction: ${JSON.stringify(data)}`);
-  }
-  return data.swapTransaction; // base64 string
+  if (!res.ok) throw new Error(`Jupiter swap failed (${res.status}): ${data?.error || JSON.stringify(data)}`);
+  if (!data.swapTransaction) throw new Error(`No swapTransaction in response: ${JSON.stringify(data)}`);
+  return data.swapTransaction;
 }
 
 // ── Step 3: Deserialise, sign and send ───────────────────────────────────────

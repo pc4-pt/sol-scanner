@@ -21,6 +21,49 @@ function save(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
 }
 
+// ── Queue sort ────────────────────────────────────────────────────────────────
+const SIGNAL_PRIORITY = {
+  "EARLY MOMENTUM": 5,
+  "UPTREND":        4,
+  "LATE RECOVERY":  3,
+  "CONSOLIDATING":  2,
+  "TOPPING OUT":    1,
+};
+
+export const QUEUE_SORT_OPTIONS = [
+  { value: "priority",   label: "Signal Priority" },
+  { value: "score",      label: "Score"           },
+  { value: "confidence", label: "Confidence"      },
+  { value: "newest",     label: "Newest First"    },
+  { value: "oldest",     label: "Oldest First"    },
+];
+
+export function sortQueue(queue, sortBy) {
+  return [...queue].sort((a, b) => {
+    const aSig  = SIGNAL_PRIORITY[a.signal?.type] || 0;
+    const bSig  = SIGNAL_PRIORITY[b.signal?.type] || 0;
+    const aConf = a.signal?.conf || 0;
+    const bConf = b.signal?.conf || 0;
+
+    switch (sortBy) {
+      case "priority":
+        // Signal tier first, then confidence × score as tiebreaker
+        if (bSig !== aSig) return bSig - aSig;
+        return (bConf * b.score) - (aConf * a.score);
+      case "score":
+        return b.score - a.score;
+      case "confidence":
+        return bConf - aConf;
+      case "newest":
+        return b.queuedAt - a.queuedAt;
+      case "oldest":
+        return a.queuedAt - b.queuedAt;
+      default:
+        return 0;
+    }
+  });
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 export function useTrading() {
   const { publicKey, signTransaction, connected } = useWallet();
@@ -28,6 +71,7 @@ export function useTrading() {
 
   const [settings,      setSettings]  = useState(() => load(KEYS.settings,  DEFAULT_TRADE_SETTINGS));
   const [queue,         setQueue]     = useState([]);
+  const [queueSort,     setQueueSort] = useState("priority");
   const [positions,     setPositions] = useState(() => load(KEYS.positions, []));
   const [history,       setHistory]   = useState(() => load(KEYS.history,   []));
   const [executing,     setExecuting] = useState({});
@@ -306,7 +350,9 @@ export function useTrading() {
 
   return {
     settings, updateSettings,
-    queue, addToQueue, removeFromQueue, updateQueueItem,
+    queue: sortQueue(queue, queueSort),
+    queueSort, setQueueSort,
+    addToQueue, removeFromQueue, updateQueueItem,
     positions, history,
     executing,
     notifications, dismissNotif,

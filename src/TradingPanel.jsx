@@ -1,6 +1,7 @@
 // ─── TradingPanel.jsx ─────────────────────────────────────────────────────────
 import { useState } from "react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
+import { QUEUE_SORT_OPTIONS, SIGNAL_PRIORITY } from "./useTrading.js";
 
 const C = {
   bg:"#0e1117",surface:"#13171f",surface2:"#161b24",surface3:"#1b2130",
@@ -408,7 +409,8 @@ export function TradingPanel({ trading, solBalance }) {
   const [activeTab, setActiveTab] = useState("queue");
   const {
     settings, updateSettings,
-    queue, positions, history,
+    queue, queueSort, setQueueSort,
+    positions, history,
     executing, notifications, dismissNotif,
     executeBuy, executeSell,
     removeFromQueue,
@@ -474,12 +476,49 @@ export function TradingPanel({ trading, solBalance }) {
             </div>
           ) : (
             <>
-              <div style={{padding:"6px 14px",background:C.surface2,borderBottom:`1px solid ${C.border}`}}>
-                <div style={{fontSize:"0.6rem",color:C.muted2,lineHeight:1.6}}>
-                  Review each token before buying. Edit stake, TP and SL per trade.
-                  {settings.autoExecute&&<span style={{color:C.warn}}> ⚠ AUTO-EXECUTE ON</span>}
+              {/* Sort bar */}
+              <div style={{padding:"8px 14px",background:C.surface2,borderBottom:`1px solid ${C.border}`,
+                display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                <span style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono,letterSpacing:"0.06em",flexShrink:0}}>
+                  SORT
+                </span>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap",flex:1}}>
+                  {QUEUE_SORT_OPTIONS.map(opt=>(
+                    <button key={opt.value} onClick={()=>setQueueSort(opt.value)} style={{
+                      padding:"3px 8px",background:queueSort===opt.value?C.accent+"18":"transparent",
+                      border:`1px solid ${queueSort===opt.value?C.accent:C.border}`,
+                      borderRadius:4,color:queueSort===opt.value?C.accent:C.muted,
+                      fontSize:"0.58rem",fontFamily:C.mono,cursor:"pointer",
+                      transition:"all 0.15s",whiteSpace:"nowrap",
+                    }}>{opt.label}</button>
+                  ))}
                 </div>
+                {settings.autoExecute&&(
+                  <span style={{fontSize:"0.58rem",color:C.warn,fontFamily:C.mono,flexShrink:0}}>
+                    ⚠ AUTO ON
+                  </span>
+                )}
               </div>
+
+              {/* Signal priority legend */}
+              <div style={{padding:"5px 14px",background:C.surface3,borderBottom:`1px solid ${C.border}`,
+                display:"flex",gap:10,flexWrap:"wrap"}}>
+                {[
+                  {label:"EARLY MOMENTUM", color:C.accent},
+                  {label:"UPTREND",        color:C.green},
+                  {label:"LATE RECOVERY",  color:"#b8f542"},
+                  {label:"CONSOLIDATING",  color:C.muted},
+                  {label:"TOPPING OUT",    color:C.red},
+                ].map(s=>(
+                  <div key={s.label} style={{display:"flex",alignItems:"center",gap:4}}>
+                    <div style={{width:5,height:5,borderRadius:"50%",background:s.color,
+                      boxShadow:`0 0 4px ${s.color}`}}/>
+                    <span style={{fontSize:"0.55rem",color:s.color,fontFamily:C.mono,
+                      letterSpacing:"0.04em"}}>{s.label}</span>
+                  </div>
+                ))}
+              </div>
+
               {queue.map(item=>(
                 <QueueItem key={item.id} item={item}
                   onApprove={executeBuy} onDismiss={removeFromQueue}
