@@ -1,5 +1,5 @@
 // ─── TradingPanel.jsx ─────────────────────────────────────────────────────────
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { QUEUE_SORT_OPTIONS, SIGNAL_PRIORITY } from "./useTrading.js";
 
@@ -195,12 +195,44 @@ function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
   const [localTP,    setLocalTP]    = useState(item.takeProfitPct);
   const [localSL,    setLocalSL]    = useState(item.stopLossPct);
   const [editing,    setEditing]    = useState(false);
-  const isExec = executing[item.id];
-  const age = Math.floor((Date.now()-item.queuedAt)/60000);
-  const sigColor = item.signal?.color||C.muted2;
+  const [now,        setNow]        = useState(Date.now());
+
+  // Tick every 30s so staleness badge stays live without hammering renders
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const isExec    = executing[item.id];
+  const queuedAge = Math.floor((now - item.queuedAt) / 60000);
+  const lastSeen  = Math.floor((now - (item.lastUpdated || item.queuedAt)) / 60000);
+  const sigColor  = item.signal?.color || C.muted2;
+
+  // Staleness: warn if not refreshed in last 3 scan cycles (~3 min)
+  const isStale   = lastSeen >= 3;
+  const staleColor = lastSeen >= 7 ? C.red : C.warn;
+
+  // Price change since first queued
+  const initPrice   = item.initPriceUsd || item.priceUsd;
+  const priceDelta  = initPrice > 0 ? ((item.priceUsd - initPrice) / initPrice) * 100 : 0;
+  const deltaColor  = priceDelta > 0 ? C.green : priceDelta < 0 ? C.red : C.muted;
 
   return (
-    <div style={{borderBottom:`1px solid ${C.border}`}}>
+    <div style={{borderBottom:`1px solid ${C.border}`,
+      opacity: isStale ? 0.75 : 1,
+      transition: "opacity 0.3s",
+    }}>
+      {/* Staleness warning bar */}
+      {isStale && (
+        <div style={{padding:"3px 14px",background:staleColor+"18",
+          borderBottom:`1px solid ${staleColor}33`,
+          display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:"0.58rem",color:staleColor,fontFamily:C.mono}}>
+            ⚠ Signal not seen in last {lastSeen}m — may have left scanner
+          </span>
+        </div>
+      )}
+
       <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10,
         padding:"11px 14px",alignItems:"start"}}>
         <div>
@@ -209,12 +241,23 @@ function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
             <Badge color={C.accent}>{item.score}</Badge>
             {item.signal&&<Badge color={sigColor}>{item.signal.icon} {item.signal.type}</Badge>}
             {item.signal&&<Badge color={sigColor}>{item.signal.conf}% conf</Badge>}
-            <Badge color={C.muted}>{age}m ago</Badge>
+            {/* Queued age */}
+            <Badge color={C.muted}>{queuedAge}m in queue</Badge>
+            {/* Last refreshed */}
+            {lastSeen > 0 && (
+              <Badge color={isStale ? staleColor : C.muted2}>
+                {isStale ? `⚠ ${lastSeen}m stale` : `↻ ${lastSeen}m ago`}
+              </Badge>
+            )}
           </div>
 
           {!editing ? (
             <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
-              {[{l:"BUY",v:localStake+" SOL",c:C.text},{l:"TP",v:"+"+localTP+"%",c:C.green},{l:"SL",v:"-"+localSL+"%",c:C.red}].map(s=>(
+              {[
+                {l:"BUY", v:localStake+" SOL", c:C.text},
+                {l:"TP",  v:"+"+localTP+"%",  c:C.green},
+                {l:"SL",  v:"-"+localSL+"%",  c:C.red},
+              ].map(s=>(
                 <div key={s.l} style={{display:"flex",gap:4,alignItems:"center"}}>
                   <span style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono}}>{s.l}</span>
                   <Mono color={s.c} size="0.72rem" weight={600}>{s.v}</Mono>
@@ -228,9 +271,9 @@ function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
           ) : (
             <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
               {[
-                {l:"SOL",val:localStake,set:setLocalStake,min:0.01,step:0.01},
-                {l:"TP%",val:localTP,   set:setLocalTP,   min:5,   step:5},
-                {l:"SL%",val:localSL,   set:setLocalSL,   min:5,   step:1},
+                {l:"SOL", val:localStake, set:setLocalStake, min:0.01, step:0.01},
+                {l:"TP%", val:localTP,    set:setLocalTP,    min:5,    step:5},
+                {l:"SL%", val:localSL,    set:setLocalSL,    min:5,    step:1},
               ].map(f=>(
                 <div key={f.l} style={{display:"flex",alignItems:"center",gap:4}}>
                   <span style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono}}>{f.l}</span>
@@ -256,7 +299,15 @@ function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
         </div>
 
         <div style={{display:"flex",flexDirection:"column",gap:6,alignItems:"flex-end"}}>
-          <Mono color={C.text} size="0.78rem" weight={600}>${item.priceUsd?.toFixed(6)}</Mono>
+          {/* Current price + delta since queued */}
+          <div style={{textAlign:"right"}}>
+            <Mono color={C.text} size="0.78rem" weight={600}>${item.priceUsd?.toFixed(6)}</Mono>
+            {Math.abs(priceDelta) >= 0.01 && (
+              <div style={{fontSize:"0.6rem",fontFamily:C.mono,color:deltaColor,marginTop:1}}>
+                {priceDelta > 0 ? "▲" : "▼"}{Math.abs(priceDelta).toFixed(2)}% since queued
+              </div>
+            )}
+          </div>
           <div style={{display:"flex",gap:5}}>
             <Btn size="sm" variant="ghost" onClick={()=>onDismiss(item.id)}>✕</Btn>
             <Btn size="sm" variant="success" disabled={isExec||!connected}

@@ -21,6 +21,9 @@ function save(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
 }
 
+// ── Queue staleness threshold (10 minutes) ────────────────────────────────────
+const QUEUE_STALE_MS = 10 * 60 * 1000;
+
 // ── Queue sort ────────────────────────────────────────────────────────────────
 const SIGNAL_PRIORITY = {
   "EARLY MOMENTUM": 5,
@@ -47,7 +50,6 @@ export function sortQueue(queue, sortBy) {
 
     switch (sortBy) {
       case "priority":
-        // Signal tier first, then confidence × score as tiebreaker
         if (bSig !== aSig) return bSig - aSig;
         return (bConf * b.score) - (aConf * a.score);
       case "score":
@@ -77,13 +79,18 @@ export function useTrading() {
   const [executing,     setExecuting] = useState({});
   const [notifications, setNotifs]   = useState([]);
 
-  const priceMonitorRef  = useRef(null);
-  const cooldownRef      = useRef({});
-  // Refs to track queued/open state synchronously (avoids stale-closure duplicates)
-  const queuedAddrsRef   = useRef(new Set());
-  const positionAddrsRef = useRef(new Set(
+  const priceMonitorRef   = useRef(null);
+  const cooldownRef       = useRef({});
+  const queuedAddrsRef    = useRef(new Set());
+  const positionAddrsRef  = useRef(new Set(
     positions.filter(p => p.status === "open").map(p => p.tokenAddress)
   ));
+  // Always-current refs used inside intervals to avoid stale closures
+  const positionsRef      = useRef(positions);
+  const autoSellFiringRef = useRef(new Set());
+
+  // Keep positionsRef current on every render
+  useEffect(() => { positionsRef.current = positions; }, [positions]);
 
   // Persist to localStorage
   useEffect(() => { save(KEYS.positions, positions); }, [positions]);
@@ -96,11 +103,7 @@ export function useTrading() {
 
   // ── Notifications ─────────────────────────────────────────────────────────
   const notify = useCallback((msg, type = "info") => {
-    const n = {
-      id:  Date.now() + Math.random(),
-      msg, type,
-      ts:  new Date().toLocaleTimeString(),
-    };
+    const n = { id: Date.now() + Math.random(), msg, type, ts: new Date().toLocaleTimeString() };
     setNotifs(prev => [n, ...prev].slice(0, 20));
   }, []);
 
@@ -108,21 +111,19 @@ export function useTrading() {
     setNotifs(prev => prev.filter(n => n.id !== id));
   }, []);
 
-  // ── Queue ─────────────────────────────────────────────────────────────────
+  // ── Queue: add ────────────────────────────────────────────────────────────
   const addToQueue = useCallback((token, signal) => {
     const addr     = token.baseToken?.address;
     const pairAddr = token.pairAddress;
     if (!addr || !pairAddr) return;
 
-    // Cooldown gate
     const last = cooldownRef.current[addr];
     if (last && Date.now() - last < settings.cooldownMinutes * 60000) return;
 
-    // Synchronous dedup via refs
-    if (queuedAddrsRef.current.has(pairAddr))  return;
-    if (positionAddrsRef.current.has(addr))    return;
+    if (queuedAddrsRef.current.has(pairAddr)) return;
+    if (positionAddrsRef.current.has(addr))   return;
 
-    queuedAddrsRef.current.add(pairAddr); // mark immediately
+    queuedAddrsRef.current.add(pairAddr);
 
     const entry = {
       id:            `q_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
@@ -131,10 +132,12 @@ export function useTrading() {
       symbol:        token.baseToken?.symbol || "?",
       name:          token.baseToken?.name   || "",
       priceUsd:      parseFloat(token.priceUsd || 0),
+      initPriceUsd:  parseFloat(token.priceUsd || 0), // locked at queue time for delta calc
       score:         token._score || 0,
       signal,
       dexUrl:        `https://dexscreener.com/solana/${pairAddr}`,
       queuedAt:      Date.now(),
+      lastUpdated:   Date.now(),
       stakeSOL:      settings.stakeSOL,
       takeProfitPct: settings.takeProfitPct,
       stopLossPct:   settings.stopLossPct,
@@ -150,6 +153,7 @@ export function useTrading() {
     });
   }, [settings, notify]);
 
+  // ── Queue: remove ─────────────────────────────────────────────────────────
   const removeFromQueue = useCallback((id) => {
     setQueue(prev => {
       const item = prev.find(q => q.id === id);
@@ -175,7 +179,6 @@ export function useTrading() {
       return;
     }
 
-    // Guard against double-tap
     setExecuting(prev => {
       if (prev[queueItem.id]) return prev;
       return { ...prev, [queueItem.id]: true };
@@ -295,10 +298,14 @@ export function useTrading() {
   }, [connected, publicKey, signTransaction, connection, settings, notify]);
 
   // ── Price monitor (15s interval) ──────────────────────────────────────────
+  // Uses positionsRef (not positions state) to avoid stale closures and
+  // re-creating the interval on every position update.
+  // autoSellFiringRef prevents duplicate auto-sells for the same position.
   useEffect(() => {
     if (priceMonitorRef.current) clearInterval(priceMonitorRef.current);
     priceMonitorRef.current = setInterval(async () => {
-      const open = positions.filter(p => p.status === "open");
+      // Read from ref — always the latest positions without closure staleness
+      const open = positionsRef.current.filter(p => p.status === "open");
       if (!open.length) return;
       for (const pos of open) {
         try {
@@ -311,28 +318,104 @@ export function useTrading() {
               ? { ...p, currentPrice: price, pnlPct: pnl?.pct ?? p.pnlPct, pnlSol: pnl?.solPnl ?? p.pnlSol }
               : p
           ));
-          if (exit && !executing[pos.id]) {
-            executeSell({ ...pos, currentPrice: price }, exit.reason);
+          if (exit && !autoSellFiringRef.current.has(pos.id)) {
+            // Re-read from ref to get the absolute latest tokensReceived
+            const freshPos = positionsRef.current.find(p => p.id === pos.id);
+            if (!freshPos || freshPos.status !== "open") continue;
+            if (!freshPos.tokensReceived || freshPos.tokensReceived <= 0) continue;
+            autoSellFiringRef.current.add(pos.id);
+            executeSell({ ...freshPos, currentPrice: price }, exit.reason)
+              .finally(() => autoSellFiringRef.current.delete(pos.id));
           }
         } catch {}
       }
     }, PRICE_POLL_MS);
     return () => clearInterval(priceMonitorRef.current);
-  }, [positions, executing, executeSell]);
+    // Only depends on executeSell — positionsRef and autoSellFiringRef are refs, not state
+  }, [executeSell]);
 
-  // ── Auto-queue from scanner ───────────────────────────────────────────────
+  // ── Auto-queue + refresh + prune from scanner ─────────────────────────────
+  // Called on every scan pass from App.jsx with the latest token list.
+  // 1. New tokens meeting criteria → addToQueue
+  // 2. Existing queue tokens seen in scan → refresh price/score/signal
+  // 3. Existing queue tokens no longer meeting criteria → auto-remove
+  // 4. Existing queue tokens stale (>10 min, not seen in scan) → auto-remove
   const checkAndQueue = useCallback((tokens, classifyMomentum) => {
     const openCount = positions.filter(p => p.status === "open").length;
-    if (openCount >= settings.maxPositions) return;
-    for (const token of tokens) {
-      if ((token._score || 0) < settings.minScore) continue;
-      const signal = classifyMomentum(token);
-      if (!signal) continue;
-      if (signal.conf < settings.minConfidence) continue;
-      if (settings.requireMomentum && !["EARLY MOMENTUM","UPTREND"].includes(signal.type)) continue;
-      addToQueue(token, signal);
+
+    // Build a lookup map of this scan's tokens by pairAddress for O(1) access
+    const scanMap = new Map(tokens.map(t => [t.pairAddress, t]));
+    const now     = Date.now();
+
+    setQueue(prev => {
+      let updated = [...prev];
+      const toRemove = new Set();
+
+      // ── Refresh / prune existing queue items ────────────────────────────
+      updated = updated.map(item => {
+        const fresh = scanMap.get(item.pairAddress);
+
+        // Not seen in this scan at all
+        if (!fresh) {
+          // If stale (queued > 10 min ago without a recent update), remove it
+          if (now - (item.lastUpdated || item.queuedAt) > QUEUE_STALE_MS) {
+            toRemove.add(item.id);
+            notify(`${item.symbol} removed from queue (signal gone)`, "warn");
+          }
+          return item; // keep until stale threshold hit
+        }
+
+        // Token is in the scan — re-evaluate criteria
+        const signal    = classifyMomentum(fresh);
+        const score     = fresh._score || 0;
+        const meetsMin  = score >= settings.minScore;
+        const meetsConf = signal && signal.conf >= settings.minConfidence;
+        const meetsMom  = !settings.requireMomentum ||
+                          ["EARLY MOMENTUM","UPTREND"].includes(signal?.type);
+
+        if (!signal || !meetsMin || !meetsConf || !meetsMom) {
+          // No longer meets criteria — schedule removal
+          toRemove.add(item.id);
+          notify(`${item.symbol} removed from queue (no longer qualifies)`, "warn");
+          return item;
+        }
+
+        // Still qualifies — update price, score, signal and timestamp
+        return {
+          ...item,
+          priceUsd:    parseFloat(fresh.priceUsd || 0),
+          score,
+          signal,
+          lastUpdated: now,
+        };
+      });
+
+      // Apply removals and clean up ref
+      if (toRemove.size > 0) {
+        updated = updated.filter(item => {
+          if (toRemove.has(item.id)) {
+            queuedAddrsRef.current.delete(item.pairAddress);
+            return false;
+          }
+          return true;
+        });
+      }
+
+      return updated;
+    });
+
+    // ── Add new qualifying tokens ──────────────────────────────────────────
+    if (openCount < settings.maxPositions) {
+      for (const token of tokens) {
+        if ((token._score || 0) < settings.minScore) continue;
+        const signal = classifyMomentum(token);
+        if (!signal) continue;
+        if (signal.conf < settings.minConfidence) continue;
+        if (settings.requireMomentum && !["EARLY MOMENTUM","UPTREND"].includes(signal.type)) continue;
+        addToQueue(token, signal);
+      }
     }
-  }, [settings, positions, addToQueue]);
+  }, [settings, positions, addToQueue, notify]);
 
   // ── Stats ─────────────────────────────────────────────────────────────────
   const stats = {
