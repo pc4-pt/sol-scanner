@@ -1,24 +1,32 @@
-// api/test.js - temporary diagnostic endpoint
+// api/test.js - test swap endpoint access
 export default async function handler(req, res) {
   const apiKey = process.env.JUPITER_API_KEY;
-  
-  // Test Jupiter with the key
-  const url = "https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=200";
-  
-  const r = await fetch(url, {
-    headers: { 
+
+  // First get a quote
+  const quoteUrl = "https://api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000000&slippageBps=200";
+  const quoteRes = await fetch(quoteUrl, { headers: { "x-api-key": apiKey } });
+  const quote = await quoteRes.json();
+
+  // Then test the swap endpoint with that quote
+  const swapRes = await fetch("https://api.jup.ag/swap/v1/swap", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
       "x-api-key": apiKey,
       "Accept": "application/json"
-    }
+    },
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: "11111111111111111111111111111111",
+      wrapAndUnwrapSol: true,
+    })
   });
-  
-  const text = await r.text();
-  
+
+  const swapText = await swapRes.text();
+
   return res.status(200).json({
-    keyPresent: !!apiKey,
-    keyLength: apiKey ? apiKey.length : 0,
-    keyPreview: apiKey ? apiKey.substring(0, 12) + "..." : "none",
-    jupiterStatus: r.status,
-    jupiterResponse: text.substring(0, 200)
+    quoteStatus: quoteRes.status,
+    swapStatus: swapRes.status,
+    swapResponse: swapText.substring(0, 300)
   });
 }
