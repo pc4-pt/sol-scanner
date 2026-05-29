@@ -168,11 +168,14 @@ function SettingsPanel({ settings, updateSettings }) {
           <NumField label="Max open positions"     field="maxPositions"    min={1}    max={20}   step={1}/>
           <NumField label="Min score to queue"     field="minScore"        min={40}   max={95}   step={5}/>
           <NumField label="Min signal confidence"  field="minConfidence"   min={30}   max={95}   step={5}    suffix="%"/>
+          <NumField label="Min vol/liq ratio"      field="minVolLiqRatio"  min={0}    max={20}   step={0.5}  suffix="x"/>
           <NumField label="Cooldown per token"     field="cooldownMinutes" min={5}    max={240}  step={5}    suffix="min"/>
         </div>
         <div style={{paddingTop:4}}>
           <Toggle label="Require momentum signal" field="requireMomentum"
             description="Only queue EARLY MOMENTUM and UPTREND signals"/>
+          <Toggle label="Scale stake by confidence" field="scaleByConfidence"
+            description="Higher confidence → larger position (50%-100% of base stake)"/>
           <Toggle label="Auto-execute trades" field="autoExecute"
             description="⚠ Buys automatically when criteria met"/>
         </div>
@@ -241,6 +244,10 @@ function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
             <Badge color={C.accent}>{item.score}</Badge>
             {item.signal&&<Badge color={sigColor}>{item.signal.icon} {item.signal.type}</Badge>}
             {item.signal&&<Badge color={sigColor}>{item.signal.conf}% conf</Badge>}
+            {/* Degradation warning — signal weakened on last scan */}
+            {item.degradeCount > 0 && (
+              <Badge color={C.warn}>⚠ fading</Badge>
+            )}
             {/* Queued age */}
             <Badge color={C.muted}>{queuedAge}m in queue</Badge>
             {/* Last refreshed */}
@@ -634,7 +641,9 @@ export function TradingPanel({ trading, solBalance }) {
               {[
                 ["Min score",        settings.minScore+"+ / 100"],
                 ["Min confidence",   settings.minConfidence+"%"],
+                ["Min vol/liq ratio",(settings.minVolLiqRatio ?? 2.0)+"x"],
                 ["Momentum filter",  settings.requireMomentum?"EARLY MOMENTUM / UPTREND":"Any signal"],
+                ["Position sizing",  settings.scaleByConfidence?"Scaled by confidence (50-100%)":"Fixed stake"],
                 ["Max positions",    settings.maxPositions],
                 ["Cooldown",         settings.cooldownMinutes+"min per token"],
                 ["Slippage",         (settings.slippageBps/100).toFixed(1)+"%"],

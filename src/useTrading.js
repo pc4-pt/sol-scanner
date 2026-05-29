@@ -112,6 +112,14 @@ export function useTrading() {
   }, []);
 
   // ── Queue: add ────────────────────────────────────────────────────────────
+  // Compute confidence-scaled stake. Confidence 50 → 75% of base, 100 → 100%.
+  // Floor 50%, so even lowest-confidence trades get half stake.
+  const scaledStake = useCallback((conf) => {
+    if (!settings.scaleByConfidence) return settings.stakeSOL;
+    const mult = 0.5 + Math.min(1, (conf || 0) / 100) * 0.5;
+    return Math.round(settings.stakeSOL * mult * 1000) / 1000;
+  }, [settings.scaleByConfidence, settings.stakeSOL]);
+
   const addToQueue = useCallback((token, signal) => {
     const addr     = token.baseToken?.address;
     const pairAddr = token.pairAddress;
@@ -124,6 +132,8 @@ export function useTrading() {
     if (positionAddrsRef.current.has(addr))   return;
 
     queuedAddrsRef.current.add(pairAddr);
+
+    const stake = scaledStake(signal?.conf);
 
     const entry = {
       id:            `q_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
@@ -138,7 +148,9 @@ export function useTrading() {
       dexUrl:        `https://dexscreener.com/solana/${pairAddr}`,
       queuedAt:      Date.now(),
       lastUpdated:   Date.now(),
-      stakeSOL:      settings.stakeSOL,
+      degradeCount:  0,                                  // tracks consecutive weak/no-momentum scans
+      stakeSOL:      stake,
+      baseStakeSOL:  settings.stakeSOL,                  // original setting for display
       takeProfitPct: settings.takeProfitPct,
       stopLossPct:   settings.stopLossPct,
     };
@@ -148,10 +160,13 @@ export function useTrading() {
         queuedAddrsRef.current.delete(pairAddr);
         return prev;
       }
-      notify(`${entry.symbol} added to queue (score ${entry.score})`, "queue");
+      const stakeNote = settings.scaleByConfidence && stake !== settings.stakeSOL
+        ? ` · ${stake} SOL (${signal?.conf || 0}% conf scaled)`
+        : "";
+      notify(`${entry.symbol} added to queue (score ${entry.score})${stakeNote}`, "queue");
       return [entry, ...prev].slice(0, 20);
     });
-  }, [settings, notify]);
+  }, [settings, notify, scaledStake]);
 
   // ── Queue: remove ─────────────────────────────────────────────────────────
   const removeFromQueue = useCallback((id) => {
@@ -336,16 +351,25 @@ export function useTrading() {
 
   // ── Auto-queue + refresh + prune from scanner ─────────────────────────────
   // Called on every scan pass from App.jsx with the latest token list.
-  // 1. New tokens meeting criteria → addToQueue
+  // 1. New tokens meeting all criteria (including V/L ratio) → addToQueue
   // 2. Existing queue tokens seen in scan → refresh price/score/signal
-  // 3. Existing queue tokens no longer meeting criteria → auto-remove
-  // 4. Existing queue tokens stale (>10 min, not seen in scan) → auto-remove
+  // 3. Tokens that degrade for 2+ consecutive scans → auto-remove
+  // 4. Tokens that no longer meet hard criteria → auto-remove
+  // 5. Tokens stale >10 min (not seen in scan) → auto-remove
   const checkAndQueue = useCallback((tokens, classifyMomentum) => {
     const openCount = positions.filter(p => p.status === "open").length;
 
     // Build a lookup map of this scan's tokens by pairAddress for O(1) access
     const scanMap = new Map(tokens.map(t => [t.pairAddress, t]));
     const now     = Date.now();
+
+    // Helper to check V/L ratio quality gate
+    const passesVolLiq = (token) => {
+      const liq   = parseFloat(token.liquidity?.usd || 0);
+      const vol24 = parseFloat(token.volume?.h24    || 0);
+      if (liq <= 0) return false;
+      return (vol24 / liq) >= (settings.minVolLiqRatio || 0);
+    };
 
     setQueue(prev => {
       let updated = [...prev];
@@ -357,40 +381,52 @@ export function useTrading() {
 
         // Not seen in this scan at all
         if (!fresh) {
-          // If stale (queued > 10 min ago without a recent update), remove it
           if (now - (item.lastUpdated || item.queuedAt) > QUEUE_STALE_MS) {
             toRemove.add(item.id);
             notify(`${item.symbol} removed from queue (signal gone)`, "warn");
           }
-          return item; // keep until stale threshold hit
+          return item;
         }
 
-        // Token is in the scan — re-evaluate criteria
+        // Token is in the scan — re-evaluate everything
         const signal    = classifyMomentum(fresh);
         const score     = fresh._score || 0;
         const meetsMin  = score >= settings.minScore;
         const meetsConf = signal && signal.conf >= settings.minConfidence;
-        const meetsMom  = !settings.requireMomentum ||
-                          ["EARLY MOMENTUM","UPTREND"].includes(signal?.type);
+        const meetsVL   = passesVolLiq(fresh);
 
-        if (!signal || !meetsMin || !meetsConf || !meetsMom) {
-          // No longer meets criteria — schedule removal
+        // Hard fails — remove immediately (regardless of degradation count)
+        if (!signal || !meetsMin || !meetsConf || !meetsVL) {
           toRemove.add(item.id);
-          notify(`${item.symbol} removed from queue (no longer qualifies)`, "warn");
+          const reason = !meetsVL ? "low volume" :
+                         !meetsMin ? "score dropped" :
+                         !signal ? "signal lost" :
+                         "low confidence";
+          notify(`${item.symbol} removed (${reason})`, "warn");
           return item;
         }
 
-        // Still qualifies — update price, score, signal and timestamp
+        // Signal degradation tracking — soft removal after 2 consecutive bad scans
+        const isStrongSig = ["EARLY MOMENTUM","UPTREND","LATE RECOVERY"].includes(signal.type);
+        const newDegrade  = isStrongSig ? 0 : (item.degradeCount || 0) + 1;
+
+        if (settings.requireMomentum && newDegrade >= 2) {
+          toRemove.add(item.id);
+          notify(`${item.symbol} removed (momentum faded — ${signal.type})`, "warn");
+          return item;
+        }
+
+        // Still qualifies — refresh
         return {
           ...item,
-          priceUsd:    parseFloat(fresh.priceUsd || 0),
+          priceUsd:     parseFloat(fresh.priceUsd || 0),
           score,
           signal,
-          lastUpdated: now,
+          lastUpdated:  now,
+          degradeCount: newDegrade,
         };
       });
 
-      // Apply removals and clean up ref
       if (toRemove.size > 0) {
         updated = updated.filter(item => {
           if (toRemove.has(item.id)) {
@@ -408,6 +444,7 @@ export function useTrading() {
     if (openCount < settings.maxPositions) {
       for (const token of tokens) {
         if ((token._score || 0) < settings.minScore) continue;
+        if (!passesVolLiq(token)) continue;                       // V/L gate
         const signal = classifyMomentum(token);
         if (!signal) continue;
         if (signal.conf < settings.minConfidence) continue;

@@ -58,23 +58,28 @@ export async function signAndSend({ swapTransactionBase64, signTransaction, conn
   try {
     const sim = await connection.simulateTransaction(tx, { sigVerify: false });
     if (sim.value.err) {
-      const logs = sim.value.logs?.join("\n") || "";
-      // Parse common errors into human-readable messages
+      const logs    = sim.value.logs?.join("\n") || "";
+      const errStr  = JSON.stringify(sim.value.err);
+
+      // Jupiter slippage errors come through as Custom error codes, not log messages.
+      // 6001 (0x1771), 6024 are both slippage-related from the Jupiter aggregator.
+      const isSlippageCustom = /"Custom":(6001|6024|6017)/.test(errStr);
+      const isSlippageLog    = logs.includes("SlippageToleranceExceeded") ||
+                               logs.includes("Slippage tolerance") ||
+                               logs.includes("0x1771");
+
       if (logs.includes("insufficient funds") || logs.includes("insufficient lamports")) {
         throw new Error("Insufficient SOL balance for this trade (including fees).");
       }
-      if (logs.includes("SlippageToleranceExceeded") || logs.includes("slippage")) {
-        throw new Error("Slippage tolerance exceeded — price moved too fast. Try increasing slippage in Settings.");
+      if (isSlippageCustom || isSlippageLog) {
+        throw new Error("SLIPPAGE_EXCEEDED");
       }
-      if (logs.includes("0x1771") || logs.includes("custom program error: 0x1771")) {
-        throw new Error("Slippage tolerance exceeded — price moved too fast. Try increasing slippage in Settings.");
-      }
-      throw new Error(`Transaction simulation failed: ${JSON.stringify(sim.value.err)}\n${logs.slice(0, 200)}`);
+      throw new Error(`Transaction simulation failed: ${errStr}\n${logs.slice(0, 200)}`);
     }
   } catch (err) {
-    // Re-throw human-readable errors, ignore simulation infra errors
-    if (err.message.includes("Insufficient") ||
-        err.message.includes("Slippage") ||
+    // Re-throw recognised errors so the caller can react
+    if (err.message === "SLIPPAGE_EXCEEDED" ||
+        err.message.includes("Insufficient") ||
         err.message.includes("simulation failed")) {
       throw err;
     }
@@ -143,7 +148,16 @@ export async function executeBuySwap({
   }
 
   const swapTxBase64 = await getSwapTransaction({ quoteResponse: quote, userPublicKey: publicKey });
-  const sig = await signAndSend({ swapTransactionBase64: swapTxBase64, signTransaction, connection });
+
+  let sig;
+  try {
+    sig = await signAndSend({ swapTransactionBase64: swapTxBase64, signTransaction, connection });
+  } catch (err) {
+    if (err.message === "SLIPPAGE_EXCEEDED") {
+      throw new Error("Slippage tolerance exceeded — price moved too fast. Increase slippage in Settings and try again.");
+    }
+    throw err;
+  }
 
   return {
     sig,
@@ -154,24 +168,53 @@ export async function executeBuySwap({
 }
 
 // ── Full sell flow ────────────────────────────────────────────────────────────
+// Sells can hit slippage errors more often than buys because:
+//  - We're often selling fast-moving tokens (TP triggers on pumps)
+//  - Token price can move 5-20% between quote and execution on volatile pairs
+// So we retry once with much wider slippage if the first attempt fails on slippage.
 export async function executeSellSwap({
   tokenMint, tokenAmount, slippageBps,
   publicKey, signTransaction, connection,
 }) {
-  const quote = await getQuote({
-    inputMint:      tokenMint,
-    outputMint:     SOL_MINT,
-    amountLamports: tokenAmount,
-    slippageBps,
-  });
+  const attempt = async (bps) => {
+    const quote = await getQuote({
+      inputMint:      tokenMint,
+      outputMint:     SOL_MINT,
+      amountLamports: tokenAmount,
+      slippageBps:    bps,
+    });
 
-  const swapTxBase64 = await getSwapTransaction({ quoteResponse: quote, userPublicKey: publicKey });
-  const sig = await signAndSend({ swapTransactionBase64: swapTxBase64, signTransaction, connection });
+    const swapTxBase64 = await getSwapTransaction({ quoteResponse: quote, userPublicKey: publicKey });
+    const sig = await signAndSend({ swapTransactionBase64: swapTxBase64, signTransaction, connection });
 
-  return {
-    sig,
-    solReceived: parseInt(quote.outAmount || 0) / 1_000_000_000,
+    return {
+      sig,
+      solReceived: parseInt(quote.outAmount || 0) / 1_000_000_000,
+    };
   };
+
+  try {
+    return await attempt(slippageBps);
+  } catch (err) {
+    // Retry once with 3x the slippage (capped at 15%) for slippage failures only
+    if (err.message === "SLIPPAGE_EXCEEDED") {
+      const widerBps = Math.min(slippageBps * 3, 1500);
+      console.warn(`[tradingEngine] sell hit slippage at ${slippageBps}bps, retrying at ${widerBps}bps`);
+      try {
+        return await attempt(widerBps);
+      } catch (retryErr) {
+        if (retryErr.message === "SLIPPAGE_EXCEEDED") {
+          throw new Error(`Slippage exceeded even at ${(widerBps/100).toFixed(1)}% — price moving too fast. Try again in a few seconds or raise default slippage in Settings.`);
+        }
+        throw retryErr;
+      }
+    }
+    if (err.message === "SLIPPAGE_EXCEEDED") {
+      // Shouldn't reach here, but just in case
+      throw new Error(`Slippage tolerance exceeded — price moved too fast. Increase slippage in Settings.`);
+    }
+    throw err;
+  }
 }
 
 // ── Fetch current price from DexScreener ─────────────────────────────────────
@@ -205,14 +248,16 @@ export function shouldTriggerExit(position, currentPrice) {
 }
 
 export const DEFAULT_TRADE_SETTINGS = {
-  stakeSOL:        0.1,
-  takeProfitPct:   50,
-  stopLossPct:     50,
-  slippageBps:     200,
-  maxPositions:    5,
-  minScore:        70,
-  minConfidence:   70,
-  requireMomentum: true,
-  cooldownMinutes: 15,
-  autoExecute:     false,
+  stakeSOL:           0.1,
+  takeProfitPct:      50,
+  stopLossPct:        20,
+  slippageBps:        200,
+  maxPositions:       5,
+  minScore:           70,
+  minConfidence:      60,
+  minVolLiqRatio:     2.0,    // 24h volume / liquidity — filters dead pools
+  requireMomentum:    true,
+  scaleByConfidence:  true,   // scale stake linearly by signal confidence
+  cooldownMinutes:    30,
+  autoExecute:        false,
 };

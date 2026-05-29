@@ -111,37 +111,85 @@ function classifyMomentum(token) {
   const buys1h = token.txns?.h1?.buys || 0; const sells1h = token.txns?.h1?.sells || 0;
   const buys5m = token.txns?.m5?.buys || 0; const sells5m = token.txns?.m5?.sells || 0;
   const vol1h = parseFloat(token.volume?.h1 || 0); const vol5m = parseFloat(token.volume?.m5 || 0);
+  const vol24 = parseFloat(token.volume?.h24 || 0);
+  const liq = parseFloat(token.liquidity?.usd || 0);
   const tx1h = buys1h + sells1h; const tx5m = buys5m + sells5m;
   const buyRatio1h = tx1h > 0 ? buys1h / tx1h : 0.5;
   const buyRatio5m = tx5m > 0 ? buys5m / tx5m : 0.5;
   const velocityRatio = vol1h > 0 ? (vol5m * 12) / vol1h : 1;
-  const buyingPressure = buyRatio1h > 0.55 && buyRatio5m > 0.55;
-  const accelerating = velocityRatio > 1.2;
+
+  // ── Quality gate: volume must justify liquidity ─────────────────────────────
+  // Stagnant pools (low V/L) and overheated pools (huge V/L on tiny liquidity)
+  // both produce unreliable signals. Reject before classifying.
+  const vlRatio = liq > 0 ? vol24 / liq : 0;
+  if (vlRatio < 0.5) return null;                  // dead pool — no real trading
+  if (liq < 10000)   return null;                  // too thin to enter/exit safely
+
+  // ── Tightened pressure thresholds ───────────────────────────────────────────
+  // 5m ratio is the strongest near-term signal. Use it as a hard floor.
+  // Anything below 0.55 means sellers are matching buyers in the last 5 min.
+  const strongBuyingNow   = buyRatio5m >= 0.6;     // hard floor for bullish signals
+  const moderateBuyingNow = buyRatio5m >= 0.55;
+  const buyingPressure    = buyRatio1h > 0.55 && buyRatio5m > 0.55;
+  const accelerating      = velocityRatio > 1.2;
   const shortUp = m5 > 0 && h1 > 0;
   const longFlat = Math.abs(h6) < 15 && Math.abs(h24) < 20;
   const longNeg = h6 < -5 || h24 < -5;
-  if (shortUp && (longFlat || longNeg) && buyingPressure) {
-    let conf = Math.min(99, Math.round(Math.min(30, m5*1.5) + Math.min(20, h1*0.5) + (longNeg?15:5) + (accelerating?20:5) + Math.min(15,(buyRatio5m-0.5)*100)));
+
+  // EARLY MOMENTUM — strongest signal. Now requires strong 5m buy pressure.
+  if (shortUp && (longFlat || longNeg) && strongBuyingNow && tx5m >= 5) {
+    let conf = Math.min(99, Math.round(
+      Math.min(30, m5*1.5) +
+      Math.min(20, h1*0.5) +
+      (longNeg ? 15 : 5) +
+      (accelerating ? 20 : 5) +
+      Math.min(15, (buyRatio5m - 0.5) * 100)
+    ));
     const strength = conf>=75?"STRONG":conf>=50?"MODERATE":"WEAK";
-    return { type:"EARLY MOMENTUM", strength, conf, color:"#00e5c3", icon:"▲", detail:`5m/1h rising, 6h/24h flat — move just starting.${accelerating?" Vol accelerating.":""}` };
+    return { type:"EARLY MOMENTUM", strength, conf, color:"#00e5c3", icon:"▲", detail:`5m/1h rising, 6h/24h flat — move just starting. ${(buyRatio5m*100).toFixed(0)}% buys (5m).${accelerating?" Vol accelerating.":""}` };
   }
-  const wasDown = h24 < -10 && h6 < -5; const turning = h1 > 2 && m5 > 0;
-  if (wasDown && turning && buyRatio1h > 0.52) {
-    let conf = Math.min(99, Math.round(Math.min(30,Math.abs(h24)*0.6)+Math.min(20,h1*0.8)+Math.min(15,m5*1.2)+20+(accelerating?15:0)));
+
+  // LATE RECOVERY — bounce off a dump. Requires moderate 5m buying.
+  const wasDown = h24 < -10 && h6 < -5;
+  const turning = h1 > 2 && m5 > 0;
+  if (wasDown && turning && moderateBuyingNow && buyRatio1h > 0.52) {
+    let conf = Math.min(99, Math.round(
+      Math.min(30, Math.abs(h24)*0.6) +
+      Math.min(20, h1*0.8) +
+      Math.min(15, m5*1.2) +
+      20 +
+      (accelerating ? 15 : 0)
+    ));
     const strength = conf>=70?"STRONG":conf>=45?"MODERATE":"WEAK";
-    return { type:"LATE RECOVERY", strength, conf, color:"#b8f542", icon:"↩", detail:`Down ${Math.abs(h24).toFixed(0)}% on 24h, bouncing ${h1.toFixed(1)}% on 1h.` };
+    return { type:"LATE RECOVERY", strength, conf, color:"#b8f542", icon:"↩", detail:`Down ${Math.abs(h24).toFixed(0)}% on 24h, bouncing ${h1.toFixed(1)}% on 1h. ${(buyRatio5m*100).toFixed(0)}% buys (5m).` };
   }
-  if (h24>40 && h1<-3 && m5<0 && buyRatio1h<0.45) {
-    let conf = Math.min(99,Math.round(Math.min(40,h24*0.3)+Math.min(30,Math.abs(h1)*2)+20));
+
+  // TOPPING OUT — pumped and now selling pressure dominates. Detect more sensitively.
+  // Now also flags if 5m buy ratio drops below 0.5 on something that's up big.
+  if (h24>40 && (m5 < 0 || buyRatio5m < 0.5) && buyRatio1h < 0.5) {
+    let conf = Math.min(99, Math.round(
+      Math.min(40, h24*0.3) +
+      Math.min(30, Math.abs(h1)*2) +
+      20 +
+      Math.min(10, (0.5 - buyRatio5m) * 100)
+    ));
     const strength = conf>=65?"STRONG":conf>=40?"MODERATE":"WEAK";
-    return { type:"TOPPING OUT", strength, conf, color:"#ff3860", icon:"▼", detail:`Up ${h24.toFixed(0)}% in 24h but reversing. Sell pressure building.` };
+    return { type:"TOPPING OUT", strength, conf, color:"#ff3860", icon:"▼", detail:`Up ${h24.toFixed(0)}% in 24h but reversing. Only ${(buyRatio5m*100).toFixed(0)}% buys (5m) — sell pressure building.` };
   }
-  if (m5>0 && h1>0 && h6>0 && h24>10) {
+
+  // UPTREND — all timeframes positive. Now requires moderate 5m buying to keep going.
+  if (m5>0 && h1>0 && h6>0 && h24>10 && moderateBuyingNow) {
     const consistent = Math.abs(h1-h6/6)<10;
-    let conf = Math.min(99,Math.round(Math.min(35,h24*0.5)+Math.min(25,h1*1.5)+(consistent?25:10)+(buyingPressure?15:5)));
+    let conf = Math.min(99, Math.round(
+      Math.min(35, h24*0.5) +
+      Math.min(25, h1*1.5) +
+      (consistent ? 25 : 10) +
+      (buyingPressure ? 15 : 5)
+    ));
     const strength = conf>=70?"STRONG":conf>=45?"MODERATE":"WEAK";
-    return { type:"UPTREND", strength, conf, color:"#2ecc40", icon:"↑", detail:`All timeframes positive.${consistent?" Consistent grind.":" Accelerating."}` };
+    return { type:"UPTREND", strength, conf, color:"#2ecc40", icon:"↑", detail:`All timeframes positive.${consistent?" Consistent grind.":" Accelerating."} ${(buyRatio5m*100).toFixed(0)}% buys (5m).` };
   }
+
   if (Math.abs(h1)<3 && Math.abs(h6)<8) return { type:"CONSOLIDATING", strength:"NEUTRAL", conf:50, color:"#666e7a", icon:"–", detail:"Tight range — potential breakout setup." };
   return null;
 }
