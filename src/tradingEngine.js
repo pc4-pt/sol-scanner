@@ -26,17 +26,25 @@ export async function getQuote({ inputMint, outputMint, amountLamports, slippage
 }
 
 // ── Step 2: POST /api/swap ────────────────────────────────────────────────────
-export async function getSwapTransaction({ quoteResponse, userPublicKey }) {
+// dynamicSlippage: when true, Jupiter calculates optimal slippage based on the
+// current routing and overrides the slippageBps from the quote. This is much
+// more reliable for volatile tokens than fixed slippage.
+export async function getSwapTransaction({ quoteResponse, userPublicKey, dynamicSlippage = false }) {
+  const body = {
+    quoteResponse,
+    userPublicKey:             userPublicKey.toString(),
+    wrapAndUnwrapSol:          true,
+    dynamicComputeUnitLimit:   true,
+    prioritizationFeeLamports: "auto",
+  };
+  if (dynamicSlippage) {
+    body.dynamicSlippage = { maxBps: 3000 }; // allow Jupiter up to 30% if needed
+  }
+
   const res = await fetch("/api/swap", {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      quoteResponse,
-      userPublicKey:           userPublicKey.toString(),
-      wrapAndUnwrapSol:        true,
-      dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: "auto",
-    }),
+    body:    JSON.stringify(body),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(`Jupiter swap build failed (${res.status}): ${data?.error || JSON.stringify(data)}`);
@@ -168,15 +176,19 @@ export async function executeBuySwap({
 }
 
 // ── Full sell flow ────────────────────────────────────────────────────────────
-// Sells can hit slippage errors more often than buys because:
-//  - We're often selling fast-moving tokens (TP triggers on pumps)
-//  - Token price can move 5-20% between quote and execution on volatile pairs
-// So we retry once with much wider slippage if the first attempt fails on slippage.
+// Sells often hit slippage on take-profit triggers because we're selling
+// tokens that just pumped — price can move 5-30% between quote and execution.
+// Strategy: three escalating attempts, each with a fresh quote from current state.
+//   1. Configured slippage (e.g. 2%)
+//   2. 3x slippage capped at 15%
+//   3. Jupiter dynamicSlippage — Jupiter calculates the right amount itself
 export async function executeSellSwap({
   tokenMint, tokenAmount, slippageBps,
   publicKey, signTransaction, connection,
 }) {
-  const attempt = async (bps) => {
+  const attempt = async (bps, useDynamicSlippage = false) => {
+    // ALWAYS fetch a fresh quote — using a stale quote causes slippage failures
+    // because the on-chain price has moved since the original quote was built.
     const quote = await getQuote({
       inputMint:      tokenMint,
       outputMint:     SOL_MINT,
@@ -184,7 +196,11 @@ export async function executeSellSwap({
       slippageBps:    bps,
     });
 
-    const swapTxBase64 = await getSwapTransaction({ quoteResponse: quote, userPublicKey: publicKey });
+    const swapTxBase64 = await getSwapTransaction({
+      quoteResponse: quote,
+      userPublicKey: publicKey,
+      dynamicSlippage: useDynamicSlippage,
+    });
     const sig = await signAndSend({ swapTransactionBase64: swapTxBase64, signTransaction, connection });
 
     return {
@@ -193,25 +209,36 @@ export async function executeSellSwap({
     };
   };
 
+  // ── Attempt 1: user-configured slippage ─────────────────────────────────
   try {
     return await attempt(slippageBps);
   } catch (err) {
-    // Retry once with 3x the slippage (capped at 15%) for slippage failures only
+    if (err.message !== "SLIPPAGE_EXCEEDED") throw err;
+    console.warn(`[tradingEngine] sell #1 failed at ${slippageBps}bps, retrying wider…`);
+  }
+
+  // Brief delay between attempts so the next quote reflects a fresh on-chain state
+  await new Promise(r => setTimeout(r, 1500));
+
+  // ── Attempt 2: 3x slippage capped at 15% ────────────────────────────────
+  const widerBps = Math.min(slippageBps * 3, 1500);
+  try {
+    return await attempt(widerBps);
+  } catch (err) {
+    if (err.message !== "SLIPPAGE_EXCEEDED") throw err;
+    console.warn(`[tradingEngine] sell #2 failed at ${widerBps}bps, trying Jupiter dynamicSlippage…`);
+  }
+
+  await new Promise(r => setTimeout(r, 1500));
+
+  // ── Attempt 3: Jupiter dynamicSlippage (lets Jupiter pick the slippage) ─
+  // maxBps 3000 = up to 30%, but Jupiter usually picks something sensible.
+  // This is the most reliable mode for volatile tokens.
+  try {
+    return await attempt(widerBps, true);
+  } catch (err) {
     if (err.message === "SLIPPAGE_EXCEEDED") {
-      const widerBps = Math.min(slippageBps * 3, 1500);
-      console.warn(`[tradingEngine] sell hit slippage at ${slippageBps}bps, retrying at ${widerBps}bps`);
-      try {
-        return await attempt(widerBps);
-      } catch (retryErr) {
-        if (retryErr.message === "SLIPPAGE_EXCEEDED") {
-          throw new Error(`Slippage exceeded even at ${(widerBps/100).toFixed(1)}% — price moving too fast. Try again in a few seconds or raise default slippage in Settings.`);
-        }
-        throw retryErr;
-      }
-    }
-    if (err.message === "SLIPPAGE_EXCEEDED") {
-      // Shouldn't reach here, but just in case
-      throw new Error(`Slippage tolerance exceeded — price moved too fast. Increase slippage in Settings.`);
+      throw new Error(`Price moving too fast — couldn't execute sell even with Jupiter's dynamic slippage. Wait 30s for volatility to ease, then try a manual sell. Token may also have a transfer tax or honeypot mechanic.`);
     }
     throw err;
   }
