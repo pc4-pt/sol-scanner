@@ -29,7 +29,7 @@ const walletStyles = `
 `;
 
 function Root() {
-  const endpoint = "https://api.mainnet-beta.solana.com";
+ const endpoint = import.meta.env.VITE_RPC_ENDPOINT || "https://api.mainnet-beta.solana.com";
   const wallets  = useMemo(() => [new PhantomWalletAdapter(), new SolflareWalletAdapter()], []);
   return (
     <ConnectionProvider endpoint={endpoint}>
