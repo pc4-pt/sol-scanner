@@ -96,33 +96,61 @@ export async function signAndSend({ swapTransactionBase64, signTransaction, conn
   }
 
   // ── Sign and send ─────────────────────────────────────────────────────────
-  // Try Phantom's preferred signAndSendTransaction first (better UX, fewer warnings)
+  // Phantom's signAndSendTransaction is preferred (better UX, fewer warnings).
+  // Critical: if signAndSendTransaction returns a signature, we MUST NOT fall
+  // back to manual sending — even if confirmation fails — or the same
+  // transaction will be submitted twice and trigger "already processed" errors.
   const provider = window?.phantom?.solana || window?.solana;
 
   if (provider?.signAndSendTransaction) {
+    let signature = null;
     try {
-      const { signature } = await provider.signAndSendTransaction(tx);
-      // Wait for confirmation
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-      const result = await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        "confirmed"
-      );
-      if (result.value.err) {
-        throw new Error(`Transaction failed on-chain: ${JSON.stringify(result.value.err)}`);
-      }
-      return signature;
+      const result = await provider.signAndSendTransaction(tx);
+      signature = result.signature;
     } catch (err) {
-      // User rejected — propagate immediately
-      if (err.message?.includes("User rejected") || err.code === 4001) {
+      // User rejected — propagate immediately, don't fall through
+      if (err.message?.includes("User rejected") ||
+          err.message?.includes("rejected") ||
+          err.code === 4001) {
         throw new Error("Transaction cancelled by user.");
       }
-      // Other error — fall through to manual method
-      console.warn("[tradingEngine] signAndSendTransaction failed, trying manual:", err.message);
+      // signAndSendTransaction itself failed before submission — safe to fall through
+      console.warn("[tradingEngine] signAndSendTransaction failed before send, trying manual:", err.message);
+    }
+
+    // If we got a signature, the tx was submitted — do NOT fall through under any circumstances
+    if (signature) {
+      try {
+        const latest = await connection.getLatestBlockhash("confirmed");
+        const conf = await connection.confirmTransaction(
+          { signature, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight },
+          "confirmed"
+        );
+        if (conf.value.err) {
+          throw new Error(`Transaction failed on-chain: ${JSON.stringify(conf.value.err)}`);
+        }
+      } catch (confErr) {
+        // Confirmation step failed but tx was submitted — check chain directly
+        // before giving up, since the tx may have actually landed.
+        console.warn("[tradingEngine] confirmation step failed, checking on-chain:", confErr.message);
+        try {
+          const status = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+          if (status?.value?.confirmationStatus === "confirmed" ||
+              status?.value?.confirmationStatus === "finalized") {
+            // Transaction did land — success
+            return signature;
+          }
+        } catch {}
+        // Genuinely failed — but DON'T re-submit, just report
+        throw new Error(`Transaction sent but confirmation timed out (sig: ${signature.slice(0,8)}…). Check Solscan to see if it landed.`);
+      }
+      return signature;
     }
   }
 
   // ── Fallback: signTransaction + sendRawTransaction ─────────────────────────
+  // Only reached if provider.signAndSendTransaction is unavailable OR it threw
+  // before submitting the transaction.
   const signed = await signTransaction(tx);
   const rawTx  = signed.serialize();
 
@@ -132,13 +160,13 @@ export async function signAndSend({ swapTransactionBase64, signTransaction, conn
     preflightCommitment: "confirmed",
   });
 
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-  const result = await connection.confirmTransaction(
-    { signature: sig, blockhash, lastValidBlockHeight },
+  const latest2 = await connection.getLatestBlockhash("confirmed");
+  const result2 = await connection.confirmTransaction(
+    { signature: sig, blockhash: latest2.blockhash, lastValidBlockHeight: latest2.lastValidBlockHeight },
     "confirmed"
   );
-  if (result.value.err) {
-    throw new Error(`Transaction failed on-chain: ${JSON.stringify(result.value.err)}`);
+  if (result2.value.err) {
+    throw new Error(`Transaction failed on-chain: ${JSON.stringify(result2.value.err)}`);
   }
   return sig;
 }
@@ -282,9 +310,15 @@ export const DEFAULT_TRADE_SETTINGS = {
   maxPositions:       5,
   minScore:           70,
   minConfidence:      60,
-  minVolLiqRatio:     2.0,    // 24h volume / liquidity — filters dead pools
+  minVolLiqRatio:     2.0,
   requireMomentum:    true,
-  scaleByConfidence:  true,   // scale stake linearly by signal confidence
+  scaleByConfidence:  true,
   cooldownMinutes:    30,
   autoExecute:        false,
+  // ── Token safety (RugCheck) ─────────────────────────────────────────────
+  enableSafetyCheck:  true,    // master toggle — calls RugCheck for each candidate
+  maxRiskScore:       60,      // RugCheck normalised score 0-100, reject above
+  allowUnprofiled:    false,   // if true, allow tokens RugCheck hasn't profiled yet
+  blockHardFails:     true,    // reject mint/freeze authority, honeypot, rugged
+  blockHighOwnership: true,    // reject top-10 high ownership danger flag
 };

@@ -179,6 +179,26 @@ function SettingsPanel({ settings, updateSettings }) {
           <Toggle label="Auto-execute trades" field="autoExecute"
             description="⚠ Buys automatically when criteria met"/>
         </div>
+
+        {/* ── Token safety (RugCheck) ───────────────────────────────────── */}
+        <div style={{marginTop:14,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
+          <div style={{fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
+            letterSpacing:"0.08em",marginBottom:6}}>TOKEN SAFETY (RUGCHECK)</div>
+          <Toggle label="Enable safety check" field="enableSafetyCheck"
+            description="Filter tokens via RugCheck before queueing — adds ~200ms per token"/>
+          {settings.enableSafetyCheck && (
+            <>
+              <NumField label="Max risk score" field="maxRiskScore" min={0} max={100} step={5} suffix="/100"/>
+              <Toggle label="Block hard fails" field="blockHardFails"
+                description="Reject mint authority, freeze authority, honeypots, rugged tokens"/>
+              <Toggle label="Block high ownership" field="blockHighOwnership"
+                description="Reject tokens with top-10 holder concentration danger flag"/>
+              <Toggle label="Allow unprofiled tokens" field="allowUnprofiled"
+                description="⚠ Allow tokens RugCheck hasn't analysed yet (risky)"/>
+            </>
+          )}
+        </div>
+
         {settings.autoExecute&&(
           <div style={{marginTop:10,padding:"8px 10px",background:C.surface3,
             borderRadius:5,border:`1px solid ${C.warn}33`}}>
@@ -244,6 +264,12 @@ function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
             <Badge color={C.accent}>{item.score}</Badge>
             {item.signal&&<Badge color={sigColor}>{item.signal.icon} {item.signal.type}</Badge>}
             {item.signal&&<Badge color={sigColor}>{item.signal.conf}% conf</Badge>}
+            {/* RugCheck safety badge */}
+            {item.safety && (() => {
+              const s = item.safety.scoreNorm ?? 0;
+              const col = s < 20 ? C.green : s < 40 ? "#b8f542" : s < 60 ? C.warn : C.red;
+              return <Badge color={col}>🛡 {s}/100</Badge>;
+            })()}
             {/* Degradation warning — signal weakened on last scan */}
             {item.degradeCount > 0 && (
               <Badge color={C.warn}>⚠ fading</Badge>
@@ -642,6 +668,9 @@ export function TradingPanel({ trading, solBalance }) {
                 ["Min score",        settings.minScore+"+ / 100"],
                 ["Min confidence",   settings.minConfidence+"%"],
                 ["Min vol/liq ratio",(settings.minVolLiqRatio ?? 2.0)+"x"],
+                ["Safety check",     settings.enableSafetyCheck
+                  ? `RugCheck on (max risk ${settings.maxRiskScore ?? 60}/100)`
+                  : "OFF"],
                 ["Momentum filter",  settings.requireMomentum?"EARLY MOMENTUM / UPTREND":"Any signal"],
                 ["Position sizing",  settings.scaleByConfidence?"Scaled by confidence (50-100%)":"Fixed stake"],
                 ["Max positions",    settings.maxPositions],

@@ -6,6 +6,7 @@ import {
   fetchCurrentPrice, calcPnl, shouldTriggerExit,
   DEFAULT_TRADE_SETTINGS, SOL_MINT, PRICE_POLL_MS,
 } from "./tradingEngine.js";
+import { checkTokenSafety } from "./safety.js";
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 const KEYS = {
@@ -88,6 +89,9 @@ export function useTrading() {
   // Always-current refs used inside intervals to avoid stale closures
   const positionsRef      = useRef(positions);
   const autoSellFiringRef = useRef(new Set());
+  // Synchronous guards against double-fire (state setters are async)
+  const buyFiringRef      = useRef(new Set());
+  const sellFiringRef     = useRef(new Set());
 
   // Keep positionsRef current on every render
   useEffect(() => { positionsRef.current = positions; }, [positions]);
@@ -120,7 +124,7 @@ export function useTrading() {
     return Math.round(settings.stakeSOL * mult * 1000) / 1000;
   }, [settings.scaleByConfidence, settings.stakeSOL]);
 
-  const addToQueue = useCallback((token, signal) => {
+  const addToQueue = useCallback((token, signal, safetyReport = null) => {
     const addr     = token.baseToken?.address;
     const pairAddr = token.pairAddress;
     if (!addr || !pairAddr) return;
@@ -142,15 +146,16 @@ export function useTrading() {
       symbol:        token.baseToken?.symbol || "?",
       name:          token.baseToken?.name   || "",
       priceUsd:      parseFloat(token.priceUsd || 0),
-      initPriceUsd:  parseFloat(token.priceUsd || 0), // locked at queue time for delta calc
+      initPriceUsd:  parseFloat(token.priceUsd || 0),
       score:         token._score || 0,
       signal,
+      safety:        safetyReport,                       // RugCheck summary (may be null)
       dexUrl:        `https://dexscreener.com/solana/${pairAddr}`,
       queuedAt:      Date.now(),
       lastUpdated:   Date.now(),
-      degradeCount:  0,                                  // tracks consecutive weak/no-momentum scans
+      degradeCount:  0,
       stakeSOL:      stake,
-      baseStakeSOL:  settings.stakeSOL,                  // original setting for display
+      baseStakeSOL:  settings.stakeSOL,
       takeProfitPct: settings.takeProfitPct,
       stopLossPct:   settings.stopLossPct,
     };
@@ -163,7 +168,10 @@ export function useTrading() {
       const stakeNote = settings.scaleByConfidence && stake !== settings.stakeSOL
         ? ` · ${stake} SOL (${signal?.conf || 0}% conf scaled)`
         : "";
-      notify(`${entry.symbol} added to queue (score ${entry.score})${stakeNote}`, "queue");
+      const safetyNote = safetyReport
+        ? ` · risk ${safetyReport.scoreNorm}/100`
+        : "";
+      notify(`${entry.symbol} added to queue (score ${entry.score})${stakeNote}${safetyNote}`, "queue");
       return [entry, ...prev].slice(0, 20);
     });
   }, [settings, notify, scaledStake]);
@@ -188,16 +196,22 @@ export function useTrading() {
       return;
     }
 
+    // Synchronous double-fire guard — state setters are async and won't block
+    // a second invocation within the same tick.
+    if (buyFiringRef.current.has(queueItem.id)) {
+      console.warn("[executeBuy] already firing for", queueItem.id);
+      return;
+    }
+    buyFiringRef.current.add(queueItem.id);
+
     const openCount = positions.filter(p => p.status === "open").length;
     if (openCount >= settings.maxPositions) {
       notify(`Max positions (${settings.maxPositions}) reached`, "warn");
+      buyFiringRef.current.delete(queueItem.id);
       return;
     }
 
-    setExecuting(prev => {
-      if (prev[queueItem.id]) return prev;
-      return { ...prev, [queueItem.id]: true };
-    });
+    setExecuting(prev => ({ ...prev, [queueItem.id]: true }));
 
     notify(`Getting quote for ${queueItem.symbol}…`, "info");
 
@@ -251,6 +265,7 @@ export function useTrading() {
       console.error("[executeBuy]", err);
     } finally {
       setExecuting(prev => ({ ...prev, [queueItem.id]: false }));
+      buyFiringRef.current.delete(queueItem.id);
     }
   }, [connected, publicKey, signTransaction, connection, positions, settings, notify]);
 
@@ -264,6 +279,13 @@ export function useTrading() {
       notify(`Cannot sell ${position.symbol}: no token amount recorded`, "error");
       return;
     }
+
+    // Synchronous double-fire guard
+    if (sellFiringRef.current.has(position.id)) {
+      console.warn("[executeSell] already firing for", position.id);
+      return;
+    }
+    sellFiringRef.current.add(position.id);
 
     setExecuting(prev => ({ ...prev, [position.id]: true }));
     notify(`Selling ${position.symbol} (${reason})…`, "info");
@@ -309,6 +331,7 @@ export function useTrading() {
       console.error("[executeSell]", err);
     } finally {
       setExecuting(prev => ({ ...prev, [position.id]: false }));
+      sellFiringRef.current.delete(position.id);
     }
   }, [connected, publicKey, signTransaction, connection, settings, notify]);
 
@@ -440,16 +463,55 @@ export function useTrading() {
       return updated;
     });
 
-    // ── Add new qualifying tokens ──────────────────────────────────────────
+    // ── Add new qualifying tokens (with async safety check) ────────────────
     if (openCount < settings.maxPositions) {
+      // First: filter through all sync gates to get candidates
+      const candidates = [];
       for (const token of tokens) {
         if ((token._score || 0) < settings.minScore) continue;
-        if (!passesVolLiq(token)) continue;                       // V/L gate
+        if (!passesVolLiq(token)) continue;
         const signal = classifyMomentum(token);
         if (!signal) continue;
         if (signal.conf < settings.minConfidence) continue;
         if (settings.requireMomentum && !["EARLY MOMENTUM","UPTREND"].includes(signal.type)) continue;
-        addToQueue(token, signal);
+        // Dedup early — no need to safety-check tokens we won't queue
+        const addr = token.baseToken?.address;
+        if (queuedAddrsRef.current.has(token.pairAddress)) continue;
+        if (positionAddrsRef.current.has(addr)) continue;
+        const last = cooldownRef.current[addr];
+        if (last && Date.now() - last < settings.cooldownMinutes * 60000) continue;
+        candidates.push({ token, signal });
+      }
+
+      // Then: run safety checks in parallel and queue only safe ones.
+      // If safety is disabled in settings, skip the API call entirely.
+      if (settings.enableSafetyCheck === false) {
+        candidates.forEach(({ token, signal }) => addToQueue(token, signal));
+      } else {
+        const safetyOpts = {
+          maxRiskScore:       settings.maxRiskScore       ?? 60,
+          allowUnprofiled:    settings.allowUnprofiled    ?? false,
+          blockHardFails:     settings.blockHardFails     ?? true,
+          blockHighOwnership: settings.blockHighOwnership ?? true,
+        };
+
+        // Fire all checks in parallel — no need to await sequentially
+        candidates.forEach(async ({ token, signal }) => {
+          try {
+            const safety = await checkTokenSafety(token.baseToken?.address, safetyOpts);
+            if (!safety.safe) {
+              // Optional: notify on rejected tokens. Could be noisy — only show hard fails.
+              if (safety.severity === "hard") {
+                notify(`✕ ${token.baseToken?.symbol || "?"} blocked: ${safety.reason}`, "warn");
+              }
+              return;
+            }
+            // Passed safety — queue it, attaching the safety report for the UI
+            addToQueue(token, signal, safety.report);
+          } catch (err) {
+            console.warn("[safety] check failed:", err.message);
+          }
+        });
       }
     }
   }, [settings, positions, addToQueue, notify]);
