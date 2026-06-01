@@ -119,16 +119,17 @@ function classifyMomentum(token) {
   const velocityRatio = vol1h > 0 ? (vol5m * 12) / vol1h : 1;
 
   // ── Quality gate: volume must justify liquidity ─────────────────────────────
-  // Stagnant pools (low V/L) and overheated pools (huge V/L on tiny liquidity)
-  // both produce unreliable signals. Reject before classifying.
   const vlRatio = liq > 0 ? vol24 / liq : 0;
-  if (vlRatio < 0.5) return null;                  // dead pool — no real trading
-  if (liq < 10000)   return null;                  // too thin to enter/exit safely
+  if (vlRatio < 0.5) return null;
+  if (liq < 10000)   return null;
 
-  // ── Tightened pressure thresholds ───────────────────────────────────────────
-  // 5m ratio is the strongest near-term signal. Use it as a hard floor.
-  // Anything below 0.55 means sellers are matching buyers in the last 5 min.
-  const strongBuyingNow   = buyRatio5m >= 0.6;     // hard floor for bullish signals
+  // ── Volatility measure: max abs price change across timeframes ─────────────
+  // This is attached to the signal so the trading engine can size SL appropriately.
+  // High volatility tokens get wider stops; quiet tokens get tighter stops.
+  const volatility = Math.max(Math.abs(m5), Math.abs(h1) * 0.5, Math.abs(h6) * 0.2);
+
+  // ── Pressure thresholds ─────────────────────────────────────────────────────
+  const strongBuyingNow   = buyRatio5m >= 0.6;
   const moderateBuyingNow = buyRatio5m >= 0.55;
   const buyingPressure    = buyRatio1h > 0.55 && buyRatio5m > 0.55;
   const accelerating      = velocityRatio > 1.2;
@@ -136,8 +137,13 @@ function classifyMomentum(token) {
   const longFlat = Math.abs(h6) < 15 && Math.abs(h24) < 20;
   const longNeg = h6 < -5 || h24 < -5;
 
-  // EARLY MOMENTUM — strongest signal. Now requires strong 5m buy pressure.
-  if (shortUp && (longFlat || longNeg) && strongBuyingNow && tx5m >= 5) {
+  // ── Late-entry rejection ───────────────────────────────────────────────────
+  // If h6 is already up >25%, the move has matured — buying now is buying the top.
+  // EARLY MOMENTUM requires h6 to be flat or recovering, not already running.
+  const tooLateForEarly = h6 > 25;
+
+  // EARLY MOMENTUM — strongest signal. Now rejects late entries.
+  if (shortUp && (longFlat || longNeg) && strongBuyingNow && tx5m >= 5 && !tooLateForEarly) {
     let conf = Math.min(99, Math.round(
       Math.min(30, m5*1.5) +
       Math.min(20, h1*0.5) +
@@ -146,7 +152,8 @@ function classifyMomentum(token) {
       Math.min(15, (buyRatio5m - 0.5) * 100)
     ));
     const strength = conf>=75?"STRONG":conf>=50?"MODERATE":"WEAK";
-    return { type:"EARLY MOMENTUM", strength, conf, color:"#00e5c3", icon:"▲", detail:`5m/1h rising, 6h/24h flat — move just starting. ${(buyRatio5m*100).toFixed(0)}% buys (5m).${accelerating?" Vol accelerating.":""}` };
+    return { type:"EARLY MOMENTUM", strength, conf, color:"#00e5c3", icon:"▲", volatility,
+      detail:`5m/1h rising, 6h/24h flat — move just starting. ${(buyRatio5m*100).toFixed(0)}% buys (5m).${accelerating?" Vol accelerating.":""}` };
   }
 
   // LATE RECOVERY — bounce off a dump. Requires moderate 5m buying.
@@ -161,11 +168,11 @@ function classifyMomentum(token) {
       (accelerating ? 15 : 0)
     ));
     const strength = conf>=70?"STRONG":conf>=45?"MODERATE":"WEAK";
-    return { type:"LATE RECOVERY", strength, conf, color:"#b8f542", icon:"↩", detail:`Down ${Math.abs(h24).toFixed(0)}% on 24h, bouncing ${h1.toFixed(1)}% on 1h. ${(buyRatio5m*100).toFixed(0)}% buys (5m).` };
+    return { type:"LATE RECOVERY", strength, conf, color:"#b8f542", icon:"↩", volatility,
+      detail:`Down ${Math.abs(h24).toFixed(0)}% on 24h, bouncing ${h1.toFixed(1)}% on 1h. ${(buyRatio5m*100).toFixed(0)}% buys (5m).` };
   }
 
-  // TOPPING OUT — pumped and now selling pressure dominates. Detect more sensitively.
-  // Now also flags if 5m buy ratio drops below 0.5 on something that's up big.
+  // TOPPING OUT — pumped and now selling pressure dominates.
   if (h24>40 && (m5 < 0 || buyRatio5m < 0.5) && buyRatio1h < 0.5) {
     let conf = Math.min(99, Math.round(
       Math.min(40, h24*0.3) +
@@ -174,11 +181,13 @@ function classifyMomentum(token) {
       Math.min(10, (0.5 - buyRatio5m) * 100)
     ));
     const strength = conf>=65?"STRONG":conf>=40?"MODERATE":"WEAK";
-    return { type:"TOPPING OUT", strength, conf, color:"#ff3860", icon:"▼", detail:`Up ${h24.toFixed(0)}% in 24h but reversing. Only ${(buyRatio5m*100).toFixed(0)}% buys (5m) — sell pressure building.` };
+    return { type:"TOPPING OUT", strength, conf, color:"#ff3860", icon:"▼", volatility,
+      detail:`Up ${h24.toFixed(0)}% in 24h but reversing. Only ${(buyRatio5m*100).toFixed(0)}% buys (5m) — sell pressure building.` };
   }
 
-  // UPTREND — all timeframes positive. Now requires moderate 5m buying to keep going.
-  if (m5>0 && h1>0 && h6>0 && h24>10 && moderateBuyingNow) {
+  // UPTREND — all timeframes positive. Reject very late entries (h6 > 40%).
+  const tooLateForUptrend = h6 > 40;
+  if (m5>0 && h1>0 && h6>0 && h24>10 && moderateBuyingNow && !tooLateForUptrend) {
     const consistent = Math.abs(h1-h6/6)<10;
     let conf = Math.min(99, Math.round(
       Math.min(35, h24*0.5) +
@@ -187,10 +196,11 @@ function classifyMomentum(token) {
       (buyingPressure ? 15 : 5)
     ));
     const strength = conf>=70?"STRONG":conf>=45?"MODERATE":"WEAK";
-    return { type:"UPTREND", strength, conf, color:"#2ecc40", icon:"↑", detail:`All timeframes positive.${consistent?" Consistent grind.":" Accelerating."} ${(buyRatio5m*100).toFixed(0)}% buys (5m).` };
+    return { type:"UPTREND", strength, conf, color:"#2ecc40", icon:"↑", volatility,
+      detail:`All timeframes positive.${consistent?" Consistent grind.":" Accelerating."} ${(buyRatio5m*100).toFixed(0)}% buys (5m).` };
   }
 
-  if (Math.abs(h1)<3 && Math.abs(h6)<8) return { type:"CONSOLIDATING", strength:"NEUTRAL", conf:50, color:"#666e7a", icon:"–", detail:"Tight range — potential breakout setup." };
+  if (Math.abs(h1)<3 && Math.abs(h6)<8) return { type:"CONSOLIDATING", strength:"NEUTRAL", conf:50, color:"#666e7a", icon:"–", volatility, detail:"Tight range — potential breakout setup." };
   return null;
 }
 

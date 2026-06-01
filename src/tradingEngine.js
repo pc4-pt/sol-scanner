@@ -50,12 +50,16 @@ export async function getTokenBalance(connection, ownerPubkey, tokenMint) {
 }
 
 // ── Step 1: GET /api/quote ────────────────────────────────────────────────────
-export async function getQuote({ inputMint, outputMint, amountLamports, slippageBps = 200 }) {
+// swapMode: "ExactIn" (default) is more forgiving on volatile tokens than ExactOut.
+// For sells we always want ExactIn so we can specify "sell this many tokens" and
+// accept whatever SOL we get back, rather than locking a target SOL amount.
+export async function getQuote({ inputMint, outputMint, amountLamports, slippageBps = 200, swapMode = "ExactIn" }) {
   const params = new URLSearchParams({
     inputMint,
     outputMint,
     amount:           String(amountLamports),
     slippageBps:      String(slippageBps),
+    swapMode,
     onlyDirectRoutes: "false",
   });
 
@@ -70,7 +74,7 @@ export async function getQuote({ inputMint, outputMint, amountLamports, slippage
 // dynamicSlippage: when true, Jupiter calculates optimal slippage based on the
 // current routing and overrides the slippageBps from the quote. This is much
 // more reliable for volatile tokens than fixed slippage.
-export async function getSwapTransaction({ quoteResponse, userPublicKey, dynamicSlippage = false }) {
+export async function getSwapTransaction({ quoteResponse, userPublicKey, dynamicSlippage = false, dynamicMaxBps = 3000 }) {
   const body = {
     quoteResponse,
     userPublicKey:             userPublicKey.toString(),
@@ -79,7 +83,7 @@ export async function getSwapTransaction({ quoteResponse, userPublicKey, dynamic
     prioritizationFeeLamports: "auto",
   };
   if (dynamicSlippage) {
-    body.dynamicSlippage = { maxBps: 3000 }; // allow Jupiter up to 30% if needed
+    body.dynamicSlippage = { maxBps: dynamicMaxBps };
   }
 
   const res = await fetch("/api/swap", {
@@ -293,19 +297,23 @@ export async function executeSellSwap({
     throw new Error("No token balance available to sell. The position may have already been sold or transferred.");
   }
 
-  const attempt = async (bps, useDynamicSlippage = false) => {
-    // ALWAYS fetch a fresh quote
+  const attempt = async (bps, useDynamicSlippage = false, dynamicMaxBps = 3000) => {
+    // ALWAYS fetch a fresh quote. ExactIn mode is critical: it tells Jupiter
+    // "sell this exact amount of tokens, accept whatever SOL comes back" which
+    // is much more tolerant of price movement than ExactOut.
     const quote = await getQuote({
       inputMint:      tokenMint,
       outputMint:     SOL_MINT,
       amountLamports: sellAmount,
       slippageBps:    bps,
+      swapMode:       "ExactIn",
     });
 
     const swapTxBase64 = await getSwapTransaction({
-      quoteResponse: quote,
-      userPublicKey: publicKey,
+      quoteResponse:   quote,
+      userPublicKey:   publicKey,
       dynamicSlippage: useDynamicSlippage,
+      dynamicMaxBps,
     });
     const sig = await signAndSend({ swapTransactionBase64: swapTxBase64, signTransaction, connection });
 
@@ -366,15 +374,33 @@ export async function executeSellSwap({
 
   // ── Attempt 3: Jupiter dynamicSlippage with fresh balance read ──────────
   try {
-    // Final attempt: re-read balance once more in case it changed mid-flow
     try {
       const onChain = await getTokenBalance(connection, publicKey, tokenMint);
       if (onChain && onChain > 0) sellAmount = Math.floor(onChain * 0.95);
     } catch {}
-    return await attempt(widerBps, true);
+    return await attempt(widerBps, true, 3000);
+  } catch (err) {
+    if (err.message !== "SLIPPAGE_EXCEEDED" && err.message !== "INSUFFICIENT_TOKEN_BALANCE") {
+      throw err;
+    }
+    console.warn(`[tradingEngine] sell #3 failed, trying emergency 50% slippage…`);
+  }
+
+  await new Promise(r => setTimeout(r, 2000));
+
+  // ── Attempt 4: EMERGENCY — 50% slippage with dynamic and 90% of balance ──
+  // Last resort for transfer-tax tokens or extreme volatility. Better to dump
+  // at -50% than leave the position stuck in a downtrend.
+  try {
+    // Re-read balance one final time
+    try {
+      const onChain = await getTokenBalance(connection, publicKey, tokenMint);
+      if (onChain && onChain > 0) sellAmount = Math.floor(onChain * 0.90);
+    } catch {}
+    return await attempt(5000, true, 5000); // 50% static + 50% dynamic cap
   } catch (err) {
     if (err.message === "SLIPPAGE_EXCEEDED") {
-      throw new Error(`Price moving too fast — couldn't execute sell even with Jupiter's dynamic slippage. Wait 30s for volatility to ease, then try a manual sell. Token may also have a transfer tax or honeypot mechanic.`);
+      throw new Error(`Sell failed even at 50% slippage. This token likely has a transfer tax, honeypot mechanic, or critically low liquidity. Check the token on RugCheck. Manual intervention via Jupiter directly (jup.ag) may be needed with very high slippage.`);
     }
     if (err.message === "INSUFFICIENT_TOKEN_BALANCE") {
       throw new Error(`Cannot sell — token balance doesn't match position record. Check your wallet on Solscan to see actual holdings. The token may have a transfer tax or you may have manually moved tokens.`);
@@ -405,11 +431,57 @@ export function calcPnl(position, currentPrice) {
   return { pct: parseFloat(pct.toFixed(2)), solPnl: parseFloat(solPnl.toFixed(6)) };
 }
 
-export function shouldTriggerExit(position, currentPrice) {
+// ── Volatility-aware stop loss ────────────────────────────────────────────────
+// Maps the volatility metric from classifyMomentum to an SL percentage.
+// Quiet token (vol < 5)   → use configured SL (e.g. 20%)
+// Active token (vol 5-15) → SL = max(configured, 25%)
+// Volatile (vol 15-30)    → SL = max(configured, 35%)
+// Wild (vol > 30)         → SL = max(configured, 45%) - capped to avoid huge losses
+// The user's configured SL acts as a FLOOR. We only widen it for volatile tokens,
+// never tighten it, so the user's risk preference is always respected.
+export function computeAdaptiveStopLoss(volatility, configuredSlPct) {
+  const base = Math.abs(configuredSlPct || 20);
+  if (!volatility || volatility < 5)  return base;
+  if (volatility < 15) return Math.max(base, 25);
+  if (volatility < 30) return Math.max(base, 35);
+  return Math.max(base, 45);
+}
+
+// ── Should the position exit? ────────────────────────────────────────────────
+// Now considers:
+//   - Grace period (no SL trigger in first 60s) — protects against buy-impact wicks
+//   - Break-even SL (once up 5%, raise SL to entry) — locks in non-loss outcomes
+//   - Adaptive SL stored on position from entry volatility
+export function shouldTriggerExit(position, currentPrice, opts = {}) {
+  const {
+    gracePeriodMs   = 60000,    // 60s after entry, no SL trigger
+    breakEvenAt     = 5,        // once up 5%, move SL to entry price
+  } = opts;
+
   if (!currentPrice || !position.entryPrice) return null;
   const pct = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
-  if (pct <= -Math.abs(position.stopLossPct))   return { reason: "STOP_LOSS",   pct };
-  if (pct >=  Math.abs(position.takeProfitPct)) return { reason: "TAKE_PROFIT", pct };
+  const ageMs = Date.now() - (position.openedAt || Date.now());
+
+  // Always take profit when target hit, regardless of grace
+  if (pct >= Math.abs(position.takeProfitPct)) return { reason: "TAKE_PROFIT", pct };
+
+  // Stop loss logic
+  const sl = Math.abs(position.stopLossPct);
+
+  // Break-even SL: once we've been up breakEvenAt%, treat entry as the SL floor.
+  // We track this via position.peakPnlPct so a temporary spike-then-drop also activates BE.
+  const peakPnl = position.peakPnlPct || 0;
+  const breakEvenActive = peakPnl >= breakEvenAt;
+
+  // Grace period: skip SL if too new (but break-even can still trigger sooner)
+  if (ageMs < gracePeriodMs && !breakEvenActive) return null;
+
+  // Standard SL
+  if (pct <= -sl) return { reason: "STOP_LOSS", pct };
+
+  // Break-even SL — if active and we've come back to entry, exit at scratch
+  if (breakEvenActive && pct <= 0) return { reason: "BREAK_EVEN_SL", pct };
+
   return null;
 }
 
@@ -427,9 +499,13 @@ export const DEFAULT_TRADE_SETTINGS = {
   cooldownMinutes:    30,
   autoExecute:        false,
   // ── Token safety (RugCheck) ─────────────────────────────────────────────
-  enableSafetyCheck:  true,    // master toggle — calls RugCheck for each candidate
-  maxRiskScore:       60,      // RugCheck normalised score 0-100, reject above
-  allowUnprofiled:    false,   // if true, allow tokens RugCheck hasn't profiled yet
-  blockHardFails:     true,    // reject mint/freeze authority, honeypot, rugged
-  blockHighOwnership: true,    // reject top-10 high ownership danger flag
+  enableSafetyCheck:  true,
+  maxRiskScore:       60,
+  allowUnprofiled:    false,
+  blockHardFails:     true,
+  blockHighOwnership: true,
+  // ── Position management (Stage A defensive) ─────────────────────────────
+  adaptiveStopLoss:   true,    // widen SL based on token's intrinsic volatility
+  graceSec:           60,      // no SL trigger in first N seconds after entry
+  breakEvenAtPct:     5,       // once up X%, move effective SL to entry price
 };

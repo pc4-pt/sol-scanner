@@ -121,10 +121,13 @@ function StatsBar({ stats }) {
 
 // ── Settings panel ────────────────────────────────────────────────────────────
 function SettingsPanel({ settings, updateSettings }) {
-  const NumField = ({ label, field, min, max, step, suffix }) => (
+  const NumField = ({ label, field, min, max, step, suffix, description }) => (
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
       padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
-      <span style={{fontSize:"0.67rem",color:C.muted2}}>{label}</span>
+      <div>
+        <div style={{fontSize:"0.67rem",color:C.muted2}}>{label}</div>
+        {description&&<div style={{fontSize:"0.6rem",color:C.muted,marginTop:1}}>{description}</div>}
+      </div>
       <div style={{display:"flex",alignItems:"center",gap:6}}>
         <input type="number" value={settings[field]} min={min} max={max} step={step}
           onChange={e=>updateSettings({[field]:parseFloat(e.target.value)})}
@@ -197,6 +200,18 @@ function SettingsPanel({ settings, updateSettings }) {
                 description="⚠ Allow tokens RugCheck hasn't analysed yet (risky)"/>
             </>
           )}
+        </div>
+
+        {/* ── Position management (Stage A defensive logic) ────────────── */}
+        <div style={{marginTop:14,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
+          <div style={{fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
+            letterSpacing:"0.08em",marginBottom:6}}>POSITION MANAGEMENT</div>
+          <Toggle label="Adaptive stop loss" field="adaptiveStopLoss"
+            description="Widen SL for high-volatility tokens (uses configured SL as floor)"/>
+          <NumField label="Grace period" field="graceSec" min={0} max={300} step={15} suffix="s"
+            description="No SL trigger in first N seconds — protects against buy-impact wicks"/>
+          <NumField label="Break-even at" field="breakEvenAtPct" min={0} max={50} step={1} suffix="%"
+            description="Once up X%, move SL to entry price (0 disables)"/>
         </div>
 
         {settings.autoExecute&&(
@@ -365,9 +380,14 @@ function PositionCard({ position, onSell, executing, connected }) {
   const pnlColor = pnl>=0?C.green:C.red;
   const tpPct = position.takeProfitPct||50;
   const slPct = position.stopLossPct||20;
+  const cfgSL = position.configuredSL ?? slPct;
   const upProg = Math.min(100,Math.max(0,(pnl/tpPct)*100));
   const dnProg = Math.min(100,Math.max(0,(-pnl/slPct)*100));
   const age = Math.floor((Date.now()-position.openedAt)/60000);
+  const ageSec = Math.floor((Date.now()-position.openedAt)/1000);
+  const inGrace = ageSec < 60;
+  const breakEven = (position.peakPnlPct || 0) >= 5;
+  const adaptiveActive = slPct > cfgSL;
 
   return (
     <div style={{borderBottom:`1px solid ${C.border}`,padding:"12px 14px"}}>
@@ -378,6 +398,9 @@ function PositionCard({ position, onSell, executing, connected }) {
             <Mono color={C.text} size="0.88rem" weight={700}>{position.symbol}</Mono>
             <Badge color={C.muted}>{age}m open</Badge>
             {position.entrySignal&&<Badge color={position.entrySignal.color}>{position.entrySignal.type}</Badge>}
+            {inGrace && <Badge color="#888">⏱ grace {60-ageSec}s</Badge>}
+            {breakEven && <Badge color={C.green}>🔒 BE locked</Badge>}
+            {adaptiveActive && <Badge color={C.warn}>SL widened {slPct}%</Badge>}
           </div>
 
           <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:10}}>
@@ -439,7 +462,7 @@ function PositionCard({ position, onSell, executing, connected }) {
 function HistoryRow({ trade }) {
   const win = (trade.pnlSol||0)>=0;
   const color = win?C.green:C.red;
-  const rColors = {TAKE_PROFIT:C.green,STOP_LOSS:C.red,MANUAL:C.muted2};
+  const rColors = {TAKE_PROFIT:C.green,STOP_LOSS:C.red,BREAK_EVEN_SL:"#888",MANUAL:C.muted2};
   const dt = new Date(trade.closedAt);
   const dateStr = dt.toLocaleDateString("en-GB",{day:"2-digit",month:"short"})+" "+dt.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
 

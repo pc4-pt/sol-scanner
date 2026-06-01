@@ -4,6 +4,7 @@ import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import {
   executeBuySwap, executeSellSwap,
   fetchCurrentPrice, calcPnl, shouldTriggerExit,
+  computeAdaptiveStopLoss,
   DEFAULT_TRADE_SETTINGS, SOL_MINT, PRICE_POLL_MS,
 } from "./tradingEngine.js";
 import { checkTokenSafety } from "./safety.js";
@@ -228,6 +229,13 @@ export function useTrading() {
         connection,
       });
 
+      // Compute adaptive stop loss based on the entry signal's volatility.
+      // The user's configured SL is treated as a FLOOR — we only widen for volatile tokens.
+      const entryVol = queueItem.signal?.volatility || 0;
+      const adaptiveSL = settings.adaptiveStopLoss
+        ? computeAdaptiveStopLoss(entryVol, queueItem.stopLossPct)
+        : queueItem.stopLossPct;
+
       const position = {
         id:             `pos_${Date.now()}`,
         pairAddress:    queueItem.pairAddress,
@@ -239,7 +247,9 @@ export function useTrading() {
         solSpent:       inAmountSol,
         tokensReceived: outAmount,
         takeProfitPct:  queueItem.takeProfitPct,
-        stopLossPct:    queueItem.stopLossPct,
+        stopLossPct:    adaptiveSL,
+        configuredSL:   queueItem.stopLossPct,    // original setting for reference
+        entryVolatility:entryVol,                  // for display
         status:         "open",
         entryTx:        sig,
         entrySignal:    queueItem.signal,
@@ -248,6 +258,7 @@ export function useTrading() {
         openedAt:       Date.now(),
         pnlPct:         0,
         pnlSol:         0,
+        peakPnlPct:     0,                         // tracked over time for break-even SL
       };
 
       positionAddrsRef.current.add(queueItem.tokenAddress);
@@ -257,7 +268,10 @@ export function useTrading() {
       setPositions(prev => [position, ...prev]);
       setQueue(prev => prev.filter(q => q.id !== queueItem.id));
 
-      notify(`✓ Bought ${queueItem.symbol} · impact ${priceImpact.toFixed(2)}% · tx ${sig.slice(0,8)}…`, "success");
+      const slNote = adaptiveSL !== queueItem.stopLossPct
+        ? ` · SL widened to ${adaptiveSL}% (volatility ${entryVol.toFixed(0)})`
+        : "";
+      notify(`✓ Bought ${queueItem.symbol} · impact ${priceImpact.toFixed(2)}%${slNote} · tx ${sig.slice(0,8)}…`, "success");
 
     } catch (err) {
       const msg = err?.message || String(err);
@@ -342,35 +356,52 @@ export function useTrading() {
   useEffect(() => {
     if (priceMonitorRef.current) clearInterval(priceMonitorRef.current);
     priceMonitorRef.current = setInterval(async () => {
-      // Read from ref — always the latest positions without closure staleness
       const open = positionsRef.current.filter(p => p.status === "open");
       if (!open.length) return;
+
+      // Exit options come from settings (Stage A defensive logic)
+      const exitOpts = {
+        gracePeriodMs: (settings.graceSec ?? 60) * 1000,
+        breakEvenAt:   settings.breakEvenAtPct ?? 5,
+      };
+
       for (const pos of open) {
         try {
           const price = await fetchCurrentPrice(pos.tokenAddress);
           if (!price) continue;
           const pnl  = calcPnl(pos, price);
-          const exit = shouldTriggerExit(pos, price);
+          // Update peakPnlPct — used by break-even SL logic
+          const newPeak = Math.max(pos.peakPnlPct || 0, pnl?.pct ?? 0);
+          // Build the version of the position used for exit decisions, including fresh peak
+          const posForExit = { ...pos, peakPnlPct: newPeak };
+          const exit = shouldTriggerExit(posForExit, price, exitOpts);
+
           setPositions(prev => prev.map(p =>
             p.id === pos.id
-              ? { ...p, currentPrice: price, pnlPct: pnl?.pct ?? p.pnlPct, pnlSol: pnl?.solPnl ?? p.pnlSol }
+              ? {
+                  ...p,
+                  currentPrice: price,
+                  pnlPct:       pnl?.pct ?? p.pnlPct,
+                  pnlSol:       pnl?.solPnl ?? p.pnlSol,
+                  peakPnlPct:   Math.max(p.peakPnlPct || 0, pnl?.pct ?? 0),
+                }
               : p
           ));
+
           if (exit && !autoSellFiringRef.current.has(pos.id)) {
-            // Re-read from ref to get the absolute latest tokensReceived
             const freshPos = positionsRef.current.find(p => p.id === pos.id);
             if (!freshPos || freshPos.status !== "open") continue;
             if (!freshPos.tokensReceived || freshPos.tokensReceived <= 0) continue;
             autoSellFiringRef.current.add(pos.id);
-            executeSell({ ...freshPos, currentPrice: price }, exit.reason)
+            executeSell({ ...freshPos, currentPrice: price, peakPnlPct: newPeak }, exit.reason)
               .finally(() => autoSellFiringRef.current.delete(pos.id));
           }
         } catch {}
       }
     }, PRICE_POLL_MS);
     return () => clearInterval(priceMonitorRef.current);
-    // Only depends on executeSell — positionsRef and autoSellFiringRef are refs, not state
-  }, [executeSell]);
+    // settings is included so grace/breakEven changes apply on next tick
+  }, [executeSell, settings.graceSec, settings.breakEvenAtPct]);
 
   // ── Auto-queue + refresh + prune from scanner ─────────────────────────────
   // Called on every scan pass from App.jsx with the latest token list.
