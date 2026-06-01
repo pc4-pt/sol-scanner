@@ -3,10 +3,51 @@
 // Routed through /api/quote and /api/swap (Vercel serverless)
 // Uses Phantom-recommended signAndSendTransaction flow to minimise warnings.
 
-import { VersionedTransaction } from "@solana/web3.js";
+import { VersionedTransaction, PublicKey } from "@solana/web3.js";
 
 export const SOL_MINT      = "So11111111111111111111111111111111111111112";
 export const PRICE_POLL_MS = 15000;
+
+// ── Fetch actual on-chain token balance ────────────────────────────────────
+// Critical for sells: the buy's quote.outAmount may differ from what actually
+// landed in your wallet (transfer taxes, slippage on the buy, rounding).
+// Always sell what you actually hold, not what you expected to receive.
+export async function getTokenBalance(connection, ownerPubkey, tokenMint) {
+  try {
+    const owner = typeof ownerPubkey === "string" ? new PublicKey(ownerPubkey) : ownerPubkey;
+    const mint  = typeof tokenMint   === "string" ? new PublicKey(tokenMint)   : tokenMint;
+
+    // Find ALL token accounts owned by wallet for this mint (covers both
+    // standard SPL and Token-2022 accounts, since they live in different programs)
+    const tokenProgram = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    const token2022    = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+    let accounts = [];
+    try {
+      const r1 = await connection.getParsedTokenAccountsByOwner(owner, { mint, programId: tokenProgram });
+      accounts = r1.value || [];
+    } catch {}
+    if (!accounts.length) {
+      try {
+        const r2 = await connection.getParsedTokenAccountsByOwner(owner, { mint, programId: token2022 });
+        accounts = r2.value || [];
+      } catch {}
+    }
+
+    if (!accounts.length) return 0;
+
+    // Sum all account balances (usually just one, but defensive)
+    let total = 0;
+    for (const acc of accounts) {
+      const amt = acc.account?.data?.parsed?.info?.tokenAmount?.amount;
+      if (amt) total += parseInt(amt, 10);
+    }
+    return total;
+  } catch (err) {
+    console.warn("[tradingEngine] getTokenBalance failed:", err.message);
+    return null; // null = could not determine, caller should fall back
+  }
+}
 
 // ── Step 1: GET /api/quote ────────────────────────────────────────────────────
 export async function getQuote({ inputMint, outputMint, amountLamports, slippageBps = 200 }) {
@@ -69,15 +110,26 @@ export async function signAndSend({ swapTransactionBase64, signTransaction, conn
       const logs    = sim.value.logs?.join("\n") || "";
       const errStr  = JSON.stringify(sim.value.err);
 
-      // Jupiter slippage errors come through as Custom error codes, not log messages.
-      // 6001 (0x1771), 6024 are both slippage-related from the Jupiter aggregator.
-      const isSlippageCustom = /"Custom":(6001|6024|6017)/.test(errStr);
+      // Jupiter V6 aggregator error codes (from IDL):
+      //   6001 (0x1771) — slippage tolerance exceeded
+      //   6017          — exact-in amount not matched
+      //   6024          — slippage tolerance exceeded (newer)
+      //   6025          — exact-out amount not matched / not enough output
+      // All are recoverable by widening slippage or fetching a fresh quote.
+      const isSlippageCustom = /"Custom":(6001|6017|6024|6025|6026)/.test(errStr);
       const isSlippageLog    = logs.includes("SlippageToleranceExceeded") ||
                                logs.includes("Slippage tolerance") ||
-                               logs.includes("0x1771");
+                               logs.includes("ExactOutAmountNotMatched") ||
+                               logs.includes("0x1771") ||
+                               logs.includes("0x1779");
 
       if (logs.includes("insufficient funds") || logs.includes("insufficient lamports")) {
         throw new Error("Insufficient SOL balance for this trade (including fees).");
+      }
+      // Insufficient token balance — sell amount > what you actually hold
+      if (logs.includes("Error: insufficient funds") ||
+          logs.includes("0x1") && logs.includes("TokenAccount")) {
+        throw new Error("INSUFFICIENT_TOKEN_BALANCE");
       }
       if (isSlippageCustom || isSlippageLog) {
         throw new Error("SLIPPAGE_EXCEEDED");
@@ -87,6 +139,7 @@ export async function signAndSend({ swapTransactionBase64, signTransaction, conn
   } catch (err) {
     // Re-throw recognised errors so the caller can react
     if (err.message === "SLIPPAGE_EXCEEDED" ||
+        err.message === "INSUFFICIENT_TOKEN_BALANCE" ||
         err.message.includes("Insufficient") ||
         err.message.includes("simulation failed")) {
       throw err;
@@ -204,23 +257,48 @@ export async function executeBuySwap({
 }
 
 // ── Full sell flow ────────────────────────────────────────────────────────────
-// Sells often hit slippage on take-profit triggers because we're selling
-// tokens that just pumped — price can move 5-30% between quote and execution.
-// Strategy: three escalating attempts, each with a fresh quote from current state.
-//   1. Configured slippage (e.g. 2%)
-//   2. 3x slippage capped at 15%
-//   3. Jupiter dynamicSlippage — Jupiter calculates the right amount itself
+// Sells fail in two main ways:
+//   1. Slippage — price moves between quote and execution
+//   2. Amount mismatch — the position record says we have N tokens but actual
+//      wallet balance is less (transfer taxes, prior partial sells, etc).
+// We solve both by:
+//   - Reading the real on-chain balance before each attempt
+//   - Selling 99% of that (1% dust buffer for token-2022 rounding)
+//   - Escalating slippage across 3 attempts with fresh quotes each time
 export async function executeSellSwap({
   tokenMint, tokenAmount, slippageBps,
   publicKey, signTransaction, connection,
 }) {
+  // Determine the actual amount we can sell from the wallet right now.
+  // If we can read the chain, prefer the real balance over the stored amount.
+  let sellAmount = tokenAmount;
+  try {
+    const onChain = await getTokenBalance(connection, publicKey, tokenMint);
+    if (onChain && onChain > 0) {
+      // Use 99% to leave a tiny dust buffer; some Token-2022 mints round oddly
+      // and selling the absolute max can fail with off-by-one errors.
+      const safe = Math.floor(onChain * 0.99);
+      if (safe > 0) {
+        if (Math.abs(safe - tokenAmount) / Math.max(tokenAmount, 1) > 0.05) {
+          console.warn(`[tradingEngine] sell amount adjusted: stored=${tokenAmount}, on-chain=${onChain}, selling=${safe}`);
+        }
+        sellAmount = safe;
+      }
+    }
+  } catch (err) {
+    console.warn("[tradingEngine] couldn't verify balance, using stored amount:", err.message);
+  }
+
+  if (!sellAmount || sellAmount <= 0) {
+    throw new Error("No token balance available to sell. The position may have already been sold or transferred.");
+  }
+
   const attempt = async (bps, useDynamicSlippage = false) => {
-    // ALWAYS fetch a fresh quote — using a stale quote causes slippage failures
-    // because the on-chain price has moved since the original quote was built.
+    // ALWAYS fetch a fresh quote
     const quote = await getQuote({
       inputMint:      tokenMint,
       outputMint:     SOL_MINT,
-      amountLamports: tokenAmount,
+      amountLamports: sellAmount,
       slippageBps:    bps,
     });
 
@@ -237,15 +315,35 @@ export async function executeSellSwap({
     };
   };
 
+  // Helper: handle balance-mismatch error by reducing sellAmount and retrying
+  const reduceAndRetry = async (bps, useDynamic) => {
+    // Re-read balance fresh and try with 95% of that
+    try {
+      const onChain = await getTokenBalance(connection, publicKey, tokenMint);
+      if (onChain && onChain > 0) {
+        sellAmount = Math.floor(onChain * 0.95);
+        console.warn(`[tradingEngine] reduced sell amount to ${sellAmount} after balance mismatch`);
+      }
+    } catch {}
+    return attempt(bps, useDynamic);
+  };
+
   // ── Attempt 1: user-configured slippage ─────────────────────────────────
   try {
     return await attempt(slippageBps);
   } catch (err) {
-    if (err.message !== "SLIPPAGE_EXCEEDED") throw err;
+    if (err.message === "INSUFFICIENT_TOKEN_BALANCE") {
+      console.warn("[tradingEngine] sell #1 — token balance mismatch, reducing and retrying");
+      try { return await reduceAndRetry(slippageBps, false); }
+      catch (err2) {
+        if (err2.message !== "SLIPPAGE_EXCEEDED") throw err2;
+      }
+    } else if (err.message !== "SLIPPAGE_EXCEEDED") {
+      throw err;
+    }
     console.warn(`[tradingEngine] sell #1 failed at ${slippageBps}bps, retrying wider…`);
   }
 
-  // Brief delay between attempts so the next quote reflects a fresh on-chain state
   await new Promise(r => setTimeout(r, 1500));
 
   // ── Attempt 2: 3x slippage capped at 15% ────────────────────────────────
@@ -253,20 +351,33 @@ export async function executeSellSwap({
   try {
     return await attempt(widerBps);
   } catch (err) {
-    if (err.message !== "SLIPPAGE_EXCEEDED") throw err;
+    if (err.message === "INSUFFICIENT_TOKEN_BALANCE") {
+      try { return await reduceAndRetry(widerBps, false); }
+      catch (err2) {
+        if (err2.message !== "SLIPPAGE_EXCEEDED") throw err2;
+      }
+    } else if (err.message !== "SLIPPAGE_EXCEEDED") {
+      throw err;
+    }
     console.warn(`[tradingEngine] sell #2 failed at ${widerBps}bps, trying Jupiter dynamicSlippage…`);
   }
 
   await new Promise(r => setTimeout(r, 1500));
 
-  // ── Attempt 3: Jupiter dynamicSlippage (lets Jupiter pick the slippage) ─
-  // maxBps 3000 = up to 30%, but Jupiter usually picks something sensible.
-  // This is the most reliable mode for volatile tokens.
+  // ── Attempt 3: Jupiter dynamicSlippage with fresh balance read ──────────
   try {
+    // Final attempt: re-read balance once more in case it changed mid-flow
+    try {
+      const onChain = await getTokenBalance(connection, publicKey, tokenMint);
+      if (onChain && onChain > 0) sellAmount = Math.floor(onChain * 0.95);
+    } catch {}
     return await attempt(widerBps, true);
   } catch (err) {
     if (err.message === "SLIPPAGE_EXCEEDED") {
       throw new Error(`Price moving too fast — couldn't execute sell even with Jupiter's dynamic slippage. Wait 30s for volatility to ease, then try a manual sell. Token may also have a transfer tax or honeypot mechanic.`);
+    }
+    if (err.message === "INSUFFICIENT_TOKEN_BALANCE") {
+      throw new Error(`Cannot sell — token balance doesn't match position record. Check your wallet on Solscan to see actual holdings. The token may have a transfer tax or you may have manually moved tokens.`);
     }
     throw err;
   }
