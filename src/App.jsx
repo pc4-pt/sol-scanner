@@ -137,13 +137,21 @@ function classifyMomentum(token) {
   const longFlat = Math.abs(h6) < 15 && Math.abs(h24) < 20;
   const longNeg = h6 < -5 || h24 < -5;
 
+  // ── Momentum quality gate ───────────────────────────────────────────────────
+  // A high buy ratio means nothing if it's based on tiny volume. Require the
+  // 5m volume to be meaningful relative to the pool: at least $5k absolute, AND
+  // at least 1% of the pool's liquidity in the last 5 minutes.
+  // This filters out signals from a handful of small buys that look like momentum.
+  const sufficientVolume = vol5m >= 5000 && (liq > 0 ? vol5m / liq >= 0.01 : true);
+  const sufficientTxns   = tx5m >= 8;     // raised from 5 — need real participation
+
   // ── Late-entry rejection ───────────────────────────────────────────────────
   // If h6 is already up >25%, the move has matured — buying now is buying the top.
   // EARLY MOMENTUM requires h6 to be flat or recovering, not already running.
   const tooLateForEarly = h6 > 25;
 
-  // EARLY MOMENTUM — strongest signal. Now rejects late entries.
-  if (shortUp && (longFlat || longNeg) && strongBuyingNow && tx5m >= 5 && !tooLateForEarly) {
+  // EARLY MOMENTUM — strongest signal. Rejects late entries + low-quality momentum.
+  if (shortUp && (longFlat || longNeg) && strongBuyingNow && sufficientTxns && sufficientVolume && !tooLateForEarly) {
     let conf = Math.min(99, Math.round(
       Math.min(30, m5*1.5) +
       Math.min(20, h1*0.5) +

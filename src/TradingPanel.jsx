@@ -202,7 +202,7 @@ function SettingsPanel({ settings, updateSettings }) {
           )}
         </div>
 
-        {/* ── Position management (Stage A defensive logic) ────────────── */}
+        {/* ── Position management (Stages A + B) ───────────────────────── */}
         <div style={{marginTop:14,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
           <div style={{fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
             letterSpacing:"0.08em",marginBottom:6}}>POSITION MANAGEMENT</div>
@@ -212,6 +212,30 @@ function SettingsPanel({ settings, updateSettings }) {
             description="No SL trigger in first N seconds — protects against buy-impact wicks"/>
           <NumField label="Break-even at" field="breakEvenAtPct" min={0} max={50} step={1} suffix="%"
             description="Once up X%, move SL to entry price (0 disables)"/>
+        </div>
+
+        {/* ── Entry confirmation ───────────────────────────────────────── */}
+        <div style={{marginTop:14,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
+          <div style={{fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
+            letterSpacing:"0.08em",marginBottom:6}}>ENTRY CONFIRMATION</div>
+          <NumField label="Required scan sightings" field="confirmScans" min={1} max={5} step={1}
+            description="Token must show signal in N consecutive scans before queueing (filters one-cycle pumps)"/>
+        </div>
+
+        {/* ── Trailing take-profit ─────────────────────────────────────── */}
+        <div style={{marginTop:14,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
+          <div style={{fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
+            letterSpacing:"0.08em",marginBottom:6}}>TRAILING TAKE-PROFIT</div>
+          <Toggle label="Enable trailing TP" field="trailingEnabled"
+            description="Let winners run beyond fixed TP — exit only on drawdown from peak"/>
+          {settings.trailingEnabled && (
+            <>
+              <NumField label="Activate at" field="trailingActivateAt" min={10} max={200} step={5} suffix="%"
+                description="Start trailing once position is up this much (fixed TP disabled above this)"/>
+              <NumField label="Trail drawdown" field="trailDrawdownPct" min={5} max={50} step={1} suffix="%"
+                description="Exit when price drops this much from peak"/>
+            </>
+          )}
         </div>
 
         {settings.autoExecute&&(
@@ -386,8 +410,11 @@ function PositionCard({ position, onSell, executing, connected }) {
   const age = Math.floor((Date.now()-position.openedAt)/60000);
   const ageSec = Math.floor((Date.now()-position.openedAt)/1000);
   const inGrace = ageSec < 60;
-  const breakEven = (position.peakPnlPct || 0) >= 5;
+  const peak = position.peakPnlPct || 0;
+  const breakEven = peak >= 5;
   const adaptiveActive = slPct > cfgSL;
+  const trailingActive = peak >= 30;
+  const trailDrop = trailingActive ? (peak - pnl) : 0;
 
   return (
     <div style={{borderBottom:`1px solid ${C.border}`,padding:"12px 14px"}}>
@@ -399,7 +426,9 @@ function PositionCard({ position, onSell, executing, connected }) {
             <Badge color={C.muted}>{age}m open</Badge>
             {position.entrySignal&&<Badge color={position.entrySignal.color}>{position.entrySignal.type}</Badge>}
             {inGrace && <Badge color="#888">⏱ grace {60-ageSec}s</Badge>}
-            {breakEven && <Badge color={C.green}>🔒 BE locked</Badge>}
+            {trailingActive
+              ? <Badge color={C.green}>📈 trailing · peak {peak.toFixed(0)}% · -{trailDrop.toFixed(1)}%</Badge>
+              : breakEven && <Badge color={C.green}>🔒 BE locked</Badge>}
             {adaptiveActive && <Badge color={C.warn}>SL widened {slPct}%</Badge>}
           </div>
 
@@ -462,7 +491,7 @@ function PositionCard({ position, onSell, executing, connected }) {
 function HistoryRow({ trade }) {
   const win = (trade.pnlSol||0)>=0;
   const color = win?C.green:C.red;
-  const rColors = {TAKE_PROFIT:C.green,STOP_LOSS:C.red,BREAK_EVEN_SL:"#888",MANUAL:C.muted2};
+  const rColors = {TAKE_PROFIT:C.green,TRAIL_STOP:C.green,STOP_LOSS:C.red,BREAK_EVEN_SL:"#888",MANUAL:C.muted2};
   const dt = new Date(trade.closedAt);
   const dateStr = dt.toLocaleDateString("en-GB",{day:"2-digit",month:"short"})+" "+dt.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
 
@@ -691,11 +720,15 @@ export function TradingPanel({ trading, solBalance }) {
                 ["Min score",        settings.minScore+"+ / 100"],
                 ["Min confidence",   settings.minConfidence+"%"],
                 ["Min vol/liq ratio",(settings.minVolLiqRatio ?? 2.0)+"x"],
+                ["Entry confirmation", `${settings.confirmScans ?? 2} scan sightings required`],
                 ["Safety check",     settings.enableSafetyCheck
                   ? `RugCheck on (max risk ${settings.maxRiskScore ?? 60}/100)`
                   : "OFF"],
                 ["Momentum filter",  settings.requireMomentum?"EARLY MOMENTUM / UPTREND":"Any signal"],
                 ["Position sizing",  settings.scaleByConfidence?"Scaled by confidence (50-100%)":"Fixed stake"],
+                ["Trailing TP",      settings.trailingEnabled
+                  ? `Active above +${settings.trailingActivateAt ?? 30}%, -${settings.trailDrawdownPct ?? 15}% drawdown`
+                  : "OFF (fixed TP only)"],
                 ["Max positions",    settings.maxPositions],
                 ["Cooldown",         settings.cooldownMinutes+"min per token"],
                 ["Slippage",         (settings.slippageBps/100).toFixed(1)+"%"],

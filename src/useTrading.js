@@ -93,6 +93,10 @@ export function useTrading() {
   // Synchronous guards against double-fire (state setters are async)
   const buyFiringRef      = useRef(new Set());
   const sellFiringRef     = useRef(new Set());
+  // Two-scan confirmation: track tokens that showed valid signals on previous scans.
+  // Map<pairAddress, { firstSeen: ts, count: int, lastSig: type }>
+  // A token must appear with a valid signal in >= confirmScans scans before queueing.
+  const candidatesRef     = useRef(new Map());
 
   // Keep positionsRef current on every render
   useEffect(() => { positionsRef.current = positions; }, [positions]);
@@ -359,10 +363,13 @@ export function useTrading() {
       const open = positionsRef.current.filter(p => p.status === "open");
       if (!open.length) return;
 
-      // Exit options come from settings (Stage A defensive logic)
+      // Exit options come from settings (Stages A + B)
       const exitOpts = {
-        gracePeriodMs: (settings.graceSec ?? 60) * 1000,
-        breakEvenAt:   settings.breakEvenAtPct ?? 5,
+        gracePeriodMs:      (settings.graceSec ?? 60) * 1000,
+        breakEvenAt:        settings.breakEvenAtPct ?? 5,
+        trailingEnabled:    settings.trailingEnabled ?? true,
+        trailingActivateAt: settings.trailingActivateAt ?? 30,
+        trailDrawdownPct:   settings.trailDrawdownPct ?? 15,
       };
 
       for (const pos of open) {
@@ -401,7 +408,8 @@ export function useTrading() {
     }, PRICE_POLL_MS);
     return () => clearInterval(priceMonitorRef.current);
     // settings is included so grace/breakEven changes apply on next tick
-  }, [executeSell, settings.graceSec, settings.breakEvenAtPct]);
+  }, [executeSell, settings.graceSec, settings.breakEvenAtPct,
+      settings.trailingEnabled, settings.trailingActivateAt, settings.trailDrawdownPct]);
 
   // ── Auto-queue + refresh + prune from scanner ─────────────────────────────
   // Called on every scan pass from App.jsx with the latest token list.
@@ -494,10 +502,14 @@ export function useTrading() {
       return updated;
     });
 
-    // ── Add new qualifying tokens (with async safety check) ────────────────
+    // ── Add new qualifying tokens (with two-scan confirmation + safety check) ─
     if (openCount < settings.maxPositions) {
+      const confirmScans  = settings.confirmScans ?? 2;     // require this many sightings
+      const candidateTTL  = 5 * 60 * 1000;                  // forget after 5 min of no sighting
+
       // First: filter through all sync gates to get candidates
       const candidates = [];
+      const seenThisScan = new Set();
       for (const token of tokens) {
         if ((token._score || 0) < settings.minScore) continue;
         if (!passesVolLiq(token)) continue;
@@ -511,11 +523,44 @@ export function useTrading() {
         if (positionAddrsRef.current.has(addr)) continue;
         const last = cooldownRef.current[addr];
         if (last && Date.now() - last < settings.cooldownMinutes * 60000) continue;
+
+        seenThisScan.add(token.pairAddress);
+
+        // ── Two-scan confirmation gate ──────────────────────────────────────
+        // First sighting: add to candidates map, do NOT queue yet.
+        // Nth sighting (N >= confirmScans): promote to safety check + queue.
+        if (confirmScans > 1) {
+          const existing = candidatesRef.current.get(token.pairAddress);
+          if (!existing) {
+            // First time we've seen this with a valid signal — start tracking
+            candidatesRef.current.set(token.pairAddress, {
+              firstSeen: now,
+              count:     1,
+              lastSig:   signal.type,
+            });
+            continue; // skip queue for this scan
+          }
+          // Already tracked — increment and check if confirmed
+          existing.count += 1;
+          existing.lastSig = signal.type;
+          if (existing.count < confirmScans) {
+            continue; // need more sightings
+          }
+          // Confirmed — falls through to queue, candidate record can be cleared
+          candidatesRef.current.delete(token.pairAddress);
+        }
+
         candidates.push({ token, signal });
       }
 
+      // Garbage-collect stale candidate records (not seen this scan, older than TTL)
+      for (const [pairAddr, info] of candidatesRef.current.entries()) {
+        if (!seenThisScan.has(pairAddr) && now - info.firstSeen > candidateTTL) {
+          candidatesRef.current.delete(pairAddr);
+        }
+      }
+
       // Then: run safety checks in parallel and queue only safe ones.
-      // If safety is disabled in settings, skip the API call entirely.
       if (settings.enableSafetyCheck === false) {
         candidates.forEach(({ token, signal }) => addToQueue(token, signal));
       } else {
@@ -526,18 +571,15 @@ export function useTrading() {
           blockHighOwnership: settings.blockHighOwnership ?? true,
         };
 
-        // Fire all checks in parallel — no need to await sequentially
         candidates.forEach(async ({ token, signal }) => {
           try {
             const safety = await checkTokenSafety(token.baseToken?.address, safetyOpts);
             if (!safety.safe) {
-              // Optional: notify on rejected tokens. Could be noisy — only show hard fails.
               if (safety.severity === "hard") {
                 notify(`✕ ${token.baseToken?.symbol || "?"} blocked: ${safety.reason}`, "warn");
               }
               return;
             }
-            // Passed safety — queue it, attaching the safety report for the UI
             addToQueue(token, signal, safety.report);
           } catch (err) {
             console.warn("[safety] check failed:", err.message);

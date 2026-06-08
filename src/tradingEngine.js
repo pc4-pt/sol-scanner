@@ -448,30 +448,48 @@ export function computeAdaptiveStopLoss(volatility, configuredSlPct) {
 }
 
 // ── Should the position exit? ────────────────────────────────────────────────
-// Now considers:
-//   - Grace period (no SL trigger in first 60s) — protects against buy-impact wicks
-//   - Break-even SL (once up 5%, raise SL to entry) — locks in non-loss outcomes
-//   - Adaptive SL stored on position from entry volatility
+// Exit logic priority order:
+//   1. TAKE_PROFIT hit (fixed target) — unless trailing is active
+//   2. TRAIL_STOP — if peak ≥ trailingActivateAt, exit when current is trailDrawdown% below peak
+//   3. BREAK_EVEN_SL — if peak ≥ breakEvenAt, exit at scratch if back at entry
+//   4. STOP_LOSS — standard SL, respects grace period
+//
+// When trailing is ENABLED and active (peak ≥ activate threshold), the fixed
+// TAKE_PROFIT is disabled — we let winners run and only exit on the trailing rule.
+// This is the asymmetric returns mechanic that makes memecoin trading profitable:
+// one +200% trade pays for many -20% losses.
 export function shouldTriggerExit(position, currentPrice, opts = {}) {
   const {
-    gracePeriodMs   = 60000,    // 60s after entry, no SL trigger
-    breakEvenAt     = 5,        // once up 5%, move SL to entry price
+    gracePeriodMs        = 60000,
+    breakEvenAt          = 5,
+    trailingEnabled      = true,
+    trailingActivateAt   = 30,    // start trailing once up this much
+    trailDrawdownPct     = 15,    // exit when peak drops by this much
   } = opts;
 
   if (!currentPrice || !position.entryPrice) return null;
-  const pct = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
-  const ageMs = Date.now() - (position.openedAt || Date.now());
+  const pct    = ((currentPrice - position.entryPrice) / position.entryPrice) * 100;
+  const ageMs  = Date.now() - (position.openedAt || Date.now());
+  const peak   = position.peakPnlPct || 0;
+  const sl     = Math.abs(position.stopLossPct);
+  const tp     = Math.abs(position.takeProfitPct);
 
-  // Always take profit when target hit, regardless of grace
-  if (pct >= Math.abs(position.takeProfitPct)) return { reason: "TAKE_PROFIT", pct };
-
-  // Stop loss logic
-  const sl = Math.abs(position.stopLossPct);
+  // Trailing take-profit
+  const trailingActive = trailingEnabled && peak >= trailingActivateAt;
+  if (trailingActive) {
+    const dropFromPeak = peak - pct;
+    if (dropFromPeak >= trailDrawdownPct) {
+      return { reason: "TRAIL_STOP", pct, peak, dropFromPeak };
+    }
+    // While trailing is active, do NOT exit on fixed TP — let it run
+    // But still allow break-even/SL to fire as risk floor
+  } else {
+    // Fixed TP only when trailing is not active (or disabled)
+    if (pct >= tp) return { reason: "TAKE_PROFIT", pct };
+  }
 
   // Break-even SL: once we've been up breakEvenAt%, treat entry as the SL floor.
-  // We track this via position.peakPnlPct so a temporary spike-then-drop also activates BE.
-  const peakPnl = position.peakPnlPct || 0;
-  const breakEvenActive = peakPnl >= breakEvenAt;
+  const breakEvenActive = peak >= breakEvenAt;
 
   // Grace period: skip SL if too new (but break-even can still trigger sooner)
   if (ageMs < gracePeriodMs && !breakEvenActive) return null;
@@ -479,7 +497,7 @@ export function shouldTriggerExit(position, currentPrice, opts = {}) {
   // Standard SL
   if (pct <= -sl) return { reason: "STOP_LOSS", pct };
 
-  // Break-even SL — if active and we've come back to entry, exit at scratch
+  // Break-even SL
   if (breakEvenActive && pct <= 0) return { reason: "BREAK_EVEN_SL", pct };
 
   return null;
@@ -492,20 +510,26 @@ export const DEFAULT_TRADE_SETTINGS = {
   slippageBps:        200,
   maxPositions:       5,
   minScore:           70,
-  minConfidence:      60,
+  minConfidence:      75,         // raised from 60 — filter marginal signals
   minVolLiqRatio:     2.0,
   requireMomentum:    true,
   scaleByConfidence:  true,
   cooldownMinutes:    30,
   autoExecute:        false,
+  // ── Entry confirmation ──────────────────────────────────────────────────
+  confirmScans:       2,          // require 2 sightings before queueing (Stage B)
   // ── Token safety (RugCheck) ─────────────────────────────────────────────
   enableSafetyCheck:  true,
   maxRiskScore:       60,
   allowUnprofiled:    false,
   blockHardFails:     true,
   blockHighOwnership: true,
-  // ── Position management (Stage A defensive) ─────────────────────────────
-  adaptiveStopLoss:   true,    // widen SL based on token's intrinsic volatility
-  graceSec:           60,      // no SL trigger in first N seconds after entry
-  breakEvenAtPct:     5,       // once up X%, move effective SL to entry price
+  // ── Position management (Stage A + B) ───────────────────────────────────
+  adaptiveStopLoss:   true,
+  graceSec:           60,
+  breakEvenAtPct:     5,
+  // ── Trailing take-profit ────────────────────────────────────────────────
+  trailingEnabled:    true,       // disable fixed TP once trailing activates
+  trailingActivateAt: 30,         // start trailing once position is up this %
+  trailDrawdownPct:   15,         // exit when peak drops by this %
 };
