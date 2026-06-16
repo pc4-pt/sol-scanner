@@ -532,4 +532,15 @@ export const DEFAULT_TRADE_SETTINGS = {
   trailingEnabled:    true,       // disable fixed TP once trailing activates
   trailingActivateAt: 30,         // start trailing once position is up this %
   trailDrawdownPct:   15,         // exit when peak drops by this %
+  // ── Notifications ───────────────────────────────────────────────────────
+  notifyBrowser:      true,       // push notifications when tab is backgrounded
+  notifySound:        true,       // play tone for queue/fill/exit/error events
+  notifyTelegram:     false,      // route events to a personal Telegram bot
+  telegramBotToken:   "",         // create via @BotFather on Telegram
+  telegramChatId:     "",         // run "Get my chat ID" after messaging bot
+  notifyOnQueue:      true,       // ping when token added to queue
+  notifyOnFill:       true,       // ping when buy/sell completes
+  notifyOnExit:       true,       // ping on auto-sell (TP/SL/trail)
+  notifyOnError:      true,       // ping on trade failures
+  notifyMinConf:      75,         // only ping for queue events at this conf or above
 };

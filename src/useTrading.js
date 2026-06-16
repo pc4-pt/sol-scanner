@@ -8,6 +8,7 @@ import {
   DEFAULT_TRADE_SETTINGS, SOL_MINT, PRICE_POLL_MS,
 } from "./tradingEngine.js";
 import { checkTokenSafety } from "./safety.js";
+import { fireNotification } from "./notifications.js";
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 const KEYS = {
@@ -94,9 +95,10 @@ export function useTrading() {
   const buyFiringRef      = useRef(new Set());
   const sellFiringRef     = useRef(new Set());
   // Two-scan confirmation: track tokens that showed valid signals on previous scans.
-  // Map<pairAddress, { firstSeen: ts, count: int, lastSig: type }>
-  // A token must appear with a valid signal in >= confirmScans scans before queueing.
   const candidatesRef     = useRef(new Map());
+  // Always-current settings reference (for use in async/interval callbacks)
+  const settingsRef       = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   // Keep positionsRef current on every render
   useEffect(() => { positionsRef.current = positions; }, [positions]);
@@ -177,6 +179,20 @@ export function useTrading() {
         ? ` · risk ${safetyReport.scoreNorm}/100`
         : "";
       notify(`${entry.symbol} added to queue (score ${entry.score})${stakeNote}${safetyNote}`, "queue");
+
+      // ── External notification (browser push / sound / Telegram) ──────────
+      // Only fire for signals at or above the user's minimum notification confidence,
+      // so low-quality signals don't generate noise.
+      const minConf = settingsRef.current.notifyMinConf ?? 75;
+      if ((signal?.conf || 0) >= minConf) {
+        fireNotification({
+          kind: "queue",
+          title: `🎯 ${entry.symbol} queued`,
+          body:  `${signal?.type} · ${signal?.conf}% conf · score ${entry.score}${safetyNote}`,
+          settings: settingsRef.current,
+        });
+      }
+
       return [entry, ...prev].slice(0, 20);
     });
   }, [settings, notify, scaledStake]);
@@ -276,11 +292,23 @@ export function useTrading() {
         ? ` · SL widened to ${adaptiveSL}% (volatility ${entryVol.toFixed(0)})`
         : "";
       notify(`✓ Bought ${queueItem.symbol} · impact ${priceImpact.toFixed(2)}%${slNote} · tx ${sig.slice(0,8)}…`, "success");
+      fireNotification({
+        kind: "fill",
+        title: `✓ Bought ${queueItem.symbol}`,
+        body:  `${inAmountSol} SOL · impact ${priceImpact.toFixed(2)}% · TP ${queueItem.takeProfitPct}% / SL ${adaptiveSL}%`,
+        settings: settingsRef.current,
+      });
 
     } catch (err) {
       const msg = err?.message || String(err);
       notify(`Buy failed: ${msg}`, "error");
       console.error("[executeBuy]", err);
+      fireNotification({
+        kind: "error",
+        title: `✗ Buy failed: ${queueItem.symbol}`,
+        body:  msg.slice(0, 200),
+        settings: settingsRef.current,
+      });
     } finally {
       setExecuting(prev => ({ ...prev, [queueItem.id]: false }));
       buyFiringRef.current.delete(queueItem.id);
@@ -342,11 +370,25 @@ export function useTrading() {
         `${pnlSol >= 0 ? "✓" : "✗"} ${position.symbol} closed (${reason}) — ${sign}${pnlPct.toFixed(1)}% / ${sign}${pnlSol.toFixed(4)} SOL`,
         pnlSol >= 0 ? "success" : "warn"
       );
+      // Manual sells fire as "fill", auto-sells (TP/SL/trail/BE) fire as "exit"
+      const isAutoExit = reason !== "MANUAL";
+      fireNotification({
+        kind: isAutoExit ? "exit" : "fill",
+        title: `${pnlSol >= 0 ? "✓" : "✗"} ${position.symbol} ${reason}`,
+        body:  `${sign}${pnlPct.toFixed(1)}% · ${sign}${pnlSol.toFixed(4)} SOL · ${solReceived.toFixed(4)} SOL received`,
+        settings: settingsRef.current,
+      });
 
     } catch (err) {
       const msg = err?.message || String(err);
       notify(`Sell failed: ${msg}`, "error");
       console.error("[executeSell]", err);
+      fireNotification({
+        kind: "error",
+        title: `✗ Sell failed: ${position.symbol}`,
+        body:  msg.slice(0, 200),
+        settings: settingsRef.current,
+      });
     } finally {
       setExecuting(prev => ({ ...prev, [position.id]: false }));
       sellFiringRef.current.delete(position.id);

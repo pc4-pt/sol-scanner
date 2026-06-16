@@ -2,6 +2,10 @@
 import { useState, useEffect } from "react";
 import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { QUEUE_SORT_OPTIONS, SIGNAL_PRIORITY } from "./useTrading.js";
+import {
+  requestBrowserPermission, browserPermissionStatus,
+  playSound, sendTelegram, fetchTelegramChatId,
+} from "./notifications.js";
 
 const C = {
   bg:"#0e1117",surface:"#13171f",surface2:"#161b24",surface3:"#1b2130",
@@ -238,6 +242,9 @@ function SettingsPanel({ settings, updateSettings }) {
           )}
         </div>
 
+        {/* ── Notifications ────────────────────────────────────────────── */}
+        <NotificationSettings settings={settings} updateSettings={updateSettings}/>
+
         {settings.autoExecute&&(
           <div style={{marginTop:10,padding:"8px 10px",background:C.surface3,
             borderRadius:5,border:`1px solid ${C.warn}33`}}>
@@ -246,6 +253,192 @@ function SettingsPanel({ settings, updateSettings }) {
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ── Notification settings (interactive — permission + test buttons) ──────────
+function NotificationSettings({ settings, updateSettings }) {
+  const [permStatus, setPermStatus] = useState(browserPermissionStatus());
+  const [tgStatus,   setTgStatus]   = useState("");
+  const [lookingUpChat, setLookingUpChat] = useState(false);
+
+  const requestPerm = async () => {
+    const result = await requestBrowserPermission();
+    setPermStatus(result);
+    if (result === "granted") {
+      // Welcome ping so the user knows it worked
+      try {
+        new Notification("Notifications enabled ✓", {
+          body: "You'll be pinged when tokens queue and trades fill.",
+          icon: "/favicon.ico",
+        });
+      } catch {}
+    }
+  };
+
+  const lookupChatId = async () => {
+    if (!settings.telegramBotToken) {
+      setTgStatus("Enter bot token first.");
+      return;
+    }
+    setLookingUpChat(true);
+    setTgStatus("Looking up — send any message to your bot now…");
+    const id = await fetchTelegramChatId(settings.telegramBotToken);
+    setLookingUpChat(false);
+    if (id) {
+      updateSettings({ telegramChatId: String(id) });
+      setTgStatus(`✓ Chat ID found: ${id}`);
+    } else {
+      setTgStatus("✗ No messages found. Send a message to your bot, then try again.");
+    }
+  };
+
+  const testTelegram = async () => {
+    if (!settings.telegramBotToken || !settings.telegramChatId) {
+      setTgStatus("Bot token and chat ID both required.");
+      return;
+    }
+    const ok = await sendTelegram({
+      botToken: settings.telegramBotToken,
+      chatId:   settings.telegramChatId,
+      message:  "*🧪 Test message*\nYour Sol Scanner notifications are working.",
+    });
+    setTgStatus(ok ? "✓ Sent — check Telegram." : "✗ Failed. Check token and chat ID.");
+  };
+
+  const Toggle = ({ label, field, description }) => (
+    <div style={{display:"flex",alignItems:"flex-start",gap:10,
+      padding:"8px 0",borderBottom:`1px solid ${C.border}`}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:"0.67rem",color:C.muted2}}>{label}</div>
+        {description&&<div style={{fontSize:"0.6rem",color:C.muted,marginTop:1}}>{description}</div>}
+      </div>
+      <input type="checkbox" checked={!!settings[field]}
+        onChange={e=>updateSettings({[field]:e.target.checked})}
+        style={{width:14,height:14,accentColor:C.accent,marginTop:2}}/>
+    </div>
+  );
+
+  return (
+    <div style={{marginTop:14,paddingTop:10,borderTop:`1px solid ${C.border}`}}>
+      <div style={{fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
+        letterSpacing:"0.08em",marginBottom:6}}>NOTIFICATIONS</div>
+
+      {/* Browser permission section */}
+      <div style={{padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:"0.67rem",color:C.muted2}}>Browser permission</div>
+            <div style={{fontSize:"0.6rem",color:C.muted,marginTop:1}}>
+              {permStatus === "granted" && "✓ Granted — notifications will fire"}
+              {permStatus === "denied"  && "✗ Denied in browser settings — unblock to use"}
+              {permStatus === "default" && "Not requested yet"}
+              {permStatus === "unsupported" && "Not supported in this browser"}
+            </div>
+          </div>
+          {permStatus !== "granted" && permStatus !== "unsupported" && (
+            <Btn size="sm" variant="default" onClick={requestPerm}>Enable</Btn>
+          )}
+        </div>
+      </div>
+
+      <Toggle label="Browser push notifications" field="notifyBrowser"
+        description="Show OS-level notifications when the tab is backgrounded"/>
+      <Toggle label="Sound alerts" field="notifySound"
+        description="Play distinct tones for queue, fill, exit, error events"/>
+
+      <div style={{padding:"7px 0",borderBottom:`1px solid ${C.border}`,
+        display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:"0.67rem",color:C.muted2}}>Test sound</div>
+          <div style={{fontSize:"0.6rem",color:C.muted,marginTop:1}}>Hear the queue chime</div>
+        </div>
+        <Btn size="sm" variant="ghost" onClick={()=>playSound("queue")}>🔊 Test</Btn>
+      </div>
+
+      <NumFieldExt label="Min confidence to notify" field="notifyMinConf" min={50} max={99} step={5} suffix="%"
+        description="Only ping for queue events at or above this confidence"
+        settings={settings} updateSettings={updateSettings}/>
+
+      <div style={{marginTop:10,fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
+        letterSpacing:"0.08em",marginBottom:4}}>EVENT TYPES</div>
+      <Toggle label="Token queued"          field="notifyOnQueue" description="When a new token enters the queue"/>
+      <Toggle label="Trade filled"          field="notifyOnFill"  description="When a buy or manual sell completes"/>
+      <Toggle label="Auto-exit (TP/SL)"     field="notifyOnExit"  description="When TP, SL, trail, or break-even fires"/>
+      <Toggle label="Errors"                field="notifyOnError" description="When a buy or sell fails"/>
+
+      {/* Telegram section */}
+      <div style={{marginTop:14,paddingTop:8,borderTop:`1px solid ${C.border}`}}>
+        <div style={{fontSize:"0.6rem",color:C.muted,fontFamily:C.mono,
+          letterSpacing:"0.08em",marginBottom:4}}>TELEGRAM (OPTIONAL)</div>
+        <div style={{fontSize:"0.6rem",color:C.muted2,lineHeight:1.6,marginBottom:8}}>
+          For notifications when away from your device:
+          <br/>1. Open Telegram, message @BotFather, send /newbot, follow prompts
+          <br/>2. Paste the bot token below
+          <br/>3. Open the bot in Telegram and send it any message (e.g. /start)
+          <br/>4. Click "Get my chat ID" to auto-fill
+        </div>
+
+        <Toggle label="Enable Telegram" field="notifyTelegram"
+          description="Send events to your personal Telegram bot"/>
+
+        {settings.notifyTelegram && (
+          <>
+            <div style={{padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
+              <div style={{fontSize:"0.67rem",color:C.muted2,marginBottom:4}}>Bot token</div>
+              <input type="text" value={settings.telegramBotToken || ""}
+                onChange={e=>updateSettings({telegramBotToken:e.target.value})}
+                placeholder="123456:ABC-DEF..."
+                style={{width:"100%",background:C.surface3,border:`1px solid ${C.border}`,
+                  borderRadius:4,color:C.text,padding:"5px 8px",
+                  fontSize:"0.68rem",fontFamily:C.mono,outline:"none"}}/>
+            </div>
+            <div style={{padding:"7px 0",borderBottom:`1px solid ${C.border}`,
+              display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:"0.67rem",color:C.muted2,marginBottom:4}}>Chat ID</div>
+                <input type="text" value={settings.telegramChatId || ""}
+                  onChange={e=>updateSettings({telegramChatId:e.target.value})}
+                  placeholder="(auto-fill or paste)"
+                  style={{width:"100%",background:C.surface3,border:`1px solid ${C.border}`,
+                    borderRadius:4,color:C.text,padding:"5px 8px",
+                    fontSize:"0.68rem",fontFamily:C.mono,outline:"none"}}/>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                <Btn size="sm" variant="default" onClick={lookupChatId} disabled={lookingUpChat}>
+                  {lookingUpChat ? "…" : "Get ID"}
+                </Btn>
+                <Btn size="sm" variant="ghost" onClick={testTelegram}>Test</Btn>
+              </div>
+            </div>
+            {tgStatus && (
+              <div style={{padding:"6px 0",fontSize:"0.6rem",color:C.muted2}}>{tgStatus}</div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Reusable NumField (used inside NotificationSettings) ─────────────────────
+function NumFieldExt({ label, field, min, max, step, suffix, description, settings, updateSettings }) {
+  return (
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+      padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
+      <div>
+        <div style={{fontSize:"0.67rem",color:C.muted2}}>{label}</div>
+        {description&&<div style={{fontSize:"0.6rem",color:C.muted,marginTop:1}}>{description}</div>}
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
+        <input type="number" value={settings[field]} min={min} max={max} step={step}
+          onChange={e=>updateSettings({[field]:parseFloat(e.target.value)})}
+          style={{width:72,background:C.surface3,border:`1px solid ${C.border}`,
+            borderRadius:4,color:C.text,padding:"3px 8px",
+            fontSize:"0.72rem",fontFamily:C.mono,textAlign:"right",outline:"none"}}/>
+        {suffix&&<span style={{fontSize:"0.62rem",color:C.muted,minWidth:24}}>{suffix}</span>}
       </div>
     </div>
   );
