@@ -591,7 +591,7 @@ function QueueItem({ item, onApprove, onDismiss, executing, connected }) {
 }
 
 // ── Position card ─────────────────────────────────────────────────────────────
-function PositionCard({ position, onSell, executing, connected }) {
+function PositionCard({ position, onSell, onRetry, onAbandon, executing, connected }) {
   const isExec = executing[position.id];
   const pnl = position.pnlPct||0;
   const pnlColor = pnl>=0?C.green:C.red;
@@ -608,9 +608,11 @@ function PositionCard({ position, onSell, executing, connected }) {
   const adaptiveActive = slPct > cfgSL;
   const trailingActive = peak >= 30;
   const trailDrop = trailingActive ? (peak - pnl) : 0;
+  const isStuck = !!position.stuck;
 
   return (
-    <div style={{borderBottom:`1px solid ${C.border}`,padding:"12px 14px"}}>
+    <div style={{borderBottom:`1px solid ${C.border}`,padding:"12px 14px",
+      background: isStuck ? `${C.red}08` : "transparent"}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10}}>
         <div>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7,flexWrap:"wrap"}}>
@@ -618,10 +620,11 @@ function PositionCard({ position, onSell, executing, connected }) {
             <Mono color={C.text} size="0.88rem" weight={700}>{position.symbol}</Mono>
             <Badge color={C.muted}>{age}m open</Badge>
             {position.entrySignal&&<Badge color={position.entrySignal.color}>{position.entrySignal.type}</Badge>}
-            {inGrace && <Badge color="#888">⏱ grace {60-ageSec}s</Badge>}
-            {trailingActive
+            {isStuck && <Badge color={C.red}>🚫 STUCK</Badge>}
+            {!isStuck && inGrace && <Badge color="#888">⏱ grace {60-ageSec}s</Badge>}
+            {!isStuck && (trailingActive
               ? <Badge color={C.green}>📈 trailing · peak {peak.toFixed(0)}% · -{trailDrop.toFixed(1)}%</Badge>
-              : breakEven && <Badge color={C.green}>🔒 BE locked</Badge>}
+              : breakEven && <Badge color={C.green}>🔒 BE locked</Badge>)}
             {adaptiveActive && <Badge color={C.warn}>SL widened {slPct}%</Badge>}
           </div>
 
@@ -659,15 +662,36 @@ function PositionCard({ position, onSell, executing, connected }) {
 
         <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:8,justifyContent:"space-between"}}>
           <PnlBadge pct={position.pnlPct} sol={position.pnlSol}/>
-          <div style={{display:"flex",gap:5}}>
+          <div style={{display:"flex",gap:5,flexWrap:"wrap",justifyContent:"flex-end"}}>
             <a href={`https://dexscreener.com/solana/${position.pairAddress}`} target="_blank" rel="noopener noreferrer">
               <Btn size="sm">CHART ↗</Btn>
+            </a>
+            <a href={`https://jup.ag/swap/${position.tokenAddress}-SOL`} target="_blank" rel="noopener noreferrer">
+              <Btn size="sm" variant="ghost">JUP ↗</Btn>
             </a>
             <Btn size="sm" variant="danger" disabled={isExec||!connected}
               onClick={()=>onSell(position,"MANUAL")}>
               {isExec?"SELLING…":"SELL"}
             </Btn>
           </div>
+          {isStuck && (
+            <div style={{display:"flex",flexDirection:"column",gap:4,alignItems:"flex-end",
+              padding:"6px 8px",background:`${C.red}15`,borderRadius:4,
+              border:`1px solid ${C.red}33`,marginTop:4}}>
+              <div style={{fontSize:"0.58rem",color:C.red,fontFamily:C.mono,textAlign:"right"}}>
+                ⚠ {position.stuckReason || "auto-sell failed"}
+              </div>
+              <div style={{display:"flex",gap:4}}>
+                <Btn size="sm" variant="ghost" onClick={()=>onRetry(position.id)}>↻ RETRY</Btn>
+                <Btn size="sm" variant="danger"
+                  onClick={()=>{
+                    if (confirm(`Abandon ${position.symbol}? This marks it as -100% loss in history without an on-chain sell. Only do this after trying to sell manually via jup.ag.`)) {
+                      onAbandon(position.id);
+                    }
+                  }}>✕ ABANDON</Btn>
+              </div>
+            </div>
+          )}
           {position.entryTx&&(
             <a href={`https://solscan.io/tx/${position.entryTx}`} target="_blank" rel="noopener noreferrer"
               style={{fontSize:"0.58rem",color:C.muted,fontFamily:C.mono,textDecoration:"none"}}>
@@ -684,7 +708,7 @@ function PositionCard({ position, onSell, executing, connected }) {
 function HistoryRow({ trade }) {
   const win = (trade.pnlSol||0)>=0;
   const color = win?C.green:C.red;
-  const rColors = {TAKE_PROFIT:C.green,TRAIL_STOP:C.green,STOP_LOSS:C.red,BREAK_EVEN_SL:"#888",MANUAL:C.muted2};
+  const rColors = {TAKE_PROFIT:C.green,TRAIL_STOP:C.green,STOP_LOSS:C.red,BREAK_EVEN_SL:"#888",MANUAL:C.muted2,ABANDONED:C.red};
   const dt = new Date(trade.closedAt);
   const dateStr = dt.toLocaleDateString("en-GB",{day:"2-digit",month:"short"})+" "+dt.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
 
@@ -742,7 +766,8 @@ export function TradingPanel({ trading, solBalance }) {
     positions, history,
     executing, notifications, dismissNotif,
     executeBuy, executeSell,
-    removeFromQueue,
+    removeFromQueue, clearQueue,
+    retryPosition, abandonPosition,
     stats, connected, walletAddress,
   } = trading;
 
@@ -827,6 +852,17 @@ export function TradingPanel({ trading, solBalance }) {
                     ⚠ AUTO ON
                   </span>
                 )}
+                <button onClick={()=>{
+                  if (queue.length === 0) return;
+                  if (confirm(`Clear all ${queue.length} tokens from the queue?`)) clearQueue();
+                }} style={{
+                  padding:"3px 8px",background:"transparent",
+                  border:`1px solid ${C.border}`,borderRadius:4,
+                  color:C.muted,fontSize:"0.58rem",fontFamily:C.mono,cursor:"pointer",
+                  flexShrink:0,
+                }} title="Clear all queued tokens">
+                  ✕ CLEAR
+                </button>
               </div>
 
               {/* Signal priority legend */}
@@ -870,7 +906,10 @@ export function TradingPanel({ trading, solBalance }) {
               </div>
               {positions.map(pos=>(
                 <PositionCard key={pos.id} position={pos}
-                  onSell={executeSell} executing={executing} connected={connected}/>
+                  onSell={executeSell}
+                  onRetry={retryPosition}
+                  onAbandon={abandonPosition}
+                  executing={executing} connected={connected}/>
               ))}
             </>
           )

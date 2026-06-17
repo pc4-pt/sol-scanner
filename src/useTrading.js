@@ -94,6 +94,9 @@ export function useTrading() {
   // Synchronous guards against double-fire (state setters are async)
   const buyFiringRef      = useRef(new Set());
   const sellFiringRef     = useRef(new Set());
+  // Track consecutive auto-sell failures per position. After 3 failures the
+  // position is marked "stuck" and auto-sell stops retrying until user intervenes.
+  const sellFailCountRef  = useRef(new Map());
   // Two-scan confirmation: track tokens that showed valid signals on previous scans.
   const candidatesRef     = useRef(new Map());
   // Always-current settings reference (for use in async/interval callbacks)
@@ -209,6 +212,52 @@ export function useTrading() {
   const updateQueueItem = useCallback((id, patch) => {
     setQueue(prev => prev.map(q => q.id === id ? { ...q, ...patch } : q));
   }, []);
+
+  // ── Clear entire queue ────────────────────────────────────────────────────
+  const clearQueue = useCallback(() => {
+    queuedAddrsRef.current.clear();
+    candidatesRef.current.clear();
+    setQueue([]);
+    notify("Queue cleared", "info");
+  }, [notify]);
+
+  // ── Retry a stuck position (clears the stuck flag, resets fail counter) ───
+  const retryPosition = useCallback((positionId) => {
+    sellFailCountRef.current.delete(positionId);
+    setPositions(prev => prev.map(p =>
+      p.id === positionId ? { ...p, stuck: false, stuckReason: null } : p
+    ));
+    notify("Position un-stuck — auto-sell will retry on next exit signal", "info");
+  }, [notify]);
+
+  // ── Abandon a stuck position (mark closed locally without on-chain sell) ──
+  // Use this when the token genuinely can't be sold (honeypot, dead liquidity).
+  // The position moves to history with exitReason "ABANDONED" and pnl = -100%
+  // (full loss assumed, since you can't extract the tokens). If you later sell
+  // the tokens manually via Jupiter, the history won't auto-update.
+  const abandonPosition = useCallback((positionId) => {
+    const pos = positionsRef.current.find(p => p.id === positionId);
+    if (!pos) return;
+    sellFailCountRef.current.delete(positionId);
+    autoSellFiringRef.current.delete(positionId);
+    positionAddrsRef.current.delete(pos.tokenAddress);
+
+    const closed = {
+      ...pos,
+      status:     "closed",
+      exitReason: "ABANDONED",
+      exitPrice:  pos.currentPrice || pos.entryPrice,
+      exitTx:     null,
+      closedAt:   Date.now(),
+      solReceived: 0,
+      pnlSol:     -Math.abs(pos.solSpent || 0),
+      pnlPct:     -100,
+    };
+
+    setPositions(prev => prev.filter(p => p.id !== positionId));
+    setHistory(prev => [closed, ...prev].slice(0, 100));
+    notify(`${pos.symbol} abandoned — marked as -100% loss. Sell manually via jup.ag if possible.`, "warn");
+  }, [notify]);
 
   // ── Execute buy ───────────────────────────────────────────────────────────
   const executeBuy = useCallback(async (queueItem) => {
@@ -363,6 +412,7 @@ export function useTrading() {
       };
 
       positionAddrsRef.current.delete(position.tokenAddress);
+      sellFailCountRef.current.delete(position.id);  // success — reset fail counter
       setPositions(prev => prev.filter(p => p.id !== position.id));
       setHistory(prev => [closed, ...prev].slice(0, 100));
 
@@ -441,8 +491,29 @@ export function useTrading() {
             const freshPos = positionsRef.current.find(p => p.id === pos.id);
             if (!freshPos || freshPos.status !== "open") continue;
             if (!freshPos.tokensReceived || freshPos.tokensReceived <= 0) continue;
+            // Stuck position: skip auto-sell if it's failed too many times.
+            // User must manually retry or abandon via the UI.
+            if (freshPos.stuck) continue;
+            const failCount = sellFailCountRef.current.get(pos.id) || 0;
+            if (failCount >= 3) {
+              // Mark as stuck — UI will show button to retry or abandon
+              setPositions(prev => prev.map(p =>
+                p.id === pos.id ? { ...p, stuck: true, stuckReason: "auto-sell failed 3 times" } : p
+              ));
+              notify(`⚠ ${freshPos.symbol} marked stuck — manual action required`, "warn");
+              continue;
+            }
             autoSellFiringRef.current.add(pos.id);
             executeSell({ ...freshPos, currentPrice: price, peakPnlPct: newPeak }, exit.reason)
+              .then(() => {
+                // Success — reset fail counter
+                sellFailCountRef.current.delete(pos.id);
+              })
+              .catch(() => {
+                // Failure — increment counter
+                const c = (sellFailCountRef.current.get(pos.id) || 0) + 1;
+                sellFailCountRef.current.set(pos.id, c);
+              })
               .finally(() => autoSellFiringRef.current.delete(pos.id));
           }
         } catch {}
@@ -649,7 +720,8 @@ export function useTrading() {
     settings, updateSettings,
     queue: sortQueue(queue, queueSort),
     queueSort, setQueueSort,
-    addToQueue, removeFromQueue, updateQueueItem,
+    addToQueue, removeFromQueue, updateQueueItem, clearQueue,
+    retryPosition, abandonPosition,
     positions, history,
     executing,
     notifications, dismissNotif,
